@@ -1,3 +1,4 @@
+import { oldestMediaDate as mediaDate } from "../packages/media-date.js";
 import type { CommandDownloadRequest, LiveCam, LiveStream, MediaCandidate, PluginContext } from "../packages/plugin-sdk/index.js";
 
 type YtDlpEntry = Record<string, unknown> & { entries?: YtDlpEntry[] };
@@ -9,16 +10,6 @@ function text(value: unknown): string | undefined {
 function number(value: unknown): number | undefined {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
-}
-
-function mediaDate(...values: unknown[]): string | undefined {
-  return values.flatMap((value) => {
-    if (typeof value === "number" && Number.isFinite(value) && value > 0) return [new Date(value > 10_000_000_000 ? value : value * 1000)];
-    const raw = text(value); if (!raw) return [];
-    const compact = raw.match(/^(\d{4})(\d{2})(\d{2})$/);
-    return [compact ? new Date(`${compact[1]}-${compact[2]}-${compact[3]}T00:00:00Z`) : new Date(raw)];
-  }).filter((date) => !Number.isNaN(date.valueOf()) && date.getUTCFullYear() >= 1900 && date.valueOf() <= Date.now() + 86_400_000)
-    .sort((left, right) => left.valueOf() - right.valueOf())[0]?.toISOString();
 }
 
 export function configuredArgs(config: Record<string, unknown>): string[] {

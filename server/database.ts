@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { asJson, id, now } from "./utils.js";
 import type { MediaCandidate, PersonCandidate, SourceCandidate } from "../packages/plugin-sdk/index.js";
+import { firstMediaDate, oldestMediaDate, validMediaDate } from "../packages/media-date.js";
 import { outputDefaults } from "../packages/output-settings.js";
 
 export type Performer = {
@@ -157,10 +158,17 @@ export class Database {
   }
 
   storedMediaMetadata(relativePath: string): Record<string, unknown> {
-    const row = this.sqlite.prepare(`SELECT p.name AS performer,s.domain AS source,i.title FROM items i
+    const normalized = relativePath.replaceAll("\\", "/");
+    const row = this.sqlite.prepare(`SELECT p.name AS performer,s.domain AS source,i.* FROM items i
       JOIN performers p ON p.id=i.performer_id JOIN sources s ON s.id=i.source_id
-      WHERE i.storage_path=? AND i.status='completed' LIMIT 1`).get(relativePath) as { performer: string; source: string; title?: string } | undefined;
-    return row ? { performer: row.performer, source: row.source, ...(row.title ? { title: row.title } : {}) } : {};
+      WHERE replace(i.storage_path,'\\','/')=? AND i.status='completed' LIMIT 1`).get(normalized) as any;
+    if (!row) return {};
+    const live = asJson<Record<string, unknown>>(row.metadata_json, {}).live === true;
+    const recordedAt = live ? firstMediaDate(row.download_started_at, row.created_at) : undefined;
+    const publishedAt = live ? recordedAt : validMediaDate(row.published_at);
+    return { performer: row.performer, source: row.source, ...(row.title ? { title: row.title } : {}),
+      live, ...(recordedAt ? { recordedAt } : {}), ...(publishedAt ? { publishedAt } : {}),
+      downloadedAt: firstMediaDate(row.download_started_at, row.created_at) };
   }
 
   updateSettings(values: Record<string, unknown>) {
@@ -352,10 +360,12 @@ export class Database {
   ingestItems(source: Source, candidates: MediaCandidate[], onStoredDateChange?: (itemId: string, publishedAt: string) => void): { added: number; upgraded: number; skipped: number } {
     let added = 0, upgraded = 0, skipped = 0; const autoGlobal = !!this.getSettings().autoQueueDiscovered;
     for (const candidate of candidates) {
-      let canonicalDate = validMediaDate(candidate.publishedAt);
-      const existing = this.sqlite.prepare("SELECT id,published_at,status,storage_path FROM items WHERE source_id=? AND external_id=?").get(source.id, candidate.externalId) as any;
+      let canonicalDate = candidate.metadata?.live === true ? now() : validMediaDate(candidate.publishedAt);
+      const existing = this.sqlite.prepare("SELECT id,published_at,status,storage_path,created_at,download_started_at FROM items WHERE source_id=? AND external_id=?").get(source.id, candidate.externalId) as any;
       if (existing) {
-        canonicalDate = oldestMediaDate(existing.published_at, canonicalDate);
+        canonicalDate = candidate.metadata?.live === true
+          ? firstMediaDate(existing.download_started_at, existing.created_at)
+          : oldestMediaDate(existing.published_at, canonicalDate);
         if (canonicalDate && canonicalDate !== existing.published_at) {
           this.sqlite.prepare("UPDATE items SET published_at=?,updated_at=? WHERE id=?").run(canonicalDate, now(), existing.id);
           if (existing.status === "completed" && existing.storage_path) onStoredDateChange?.(existing.id, canonicalDate);
@@ -470,11 +480,12 @@ export class Database {
   setItemStatus(itemId: string, status: string, values: { progress?: number; downloadedBytes?: number; error?: string | null; checksum?: string; storagePath?: string; duplicateOf?: string } = {}) {
     const stamp = now();
     this.sqlite.prepare(`UPDATE items SET status=?,progress=COALESCE(?,progress),downloaded_bytes=CASE WHEN ?='queued' THEN 0 ELSE COALESCE(?,downloaded_bytes) END,error=?,checksum_sha256=COALESCE(?,checksum_sha256),storage_path=COALESCE(?,storage_path),duplicate_of=COALESCE(?,duplicate_of),
+      published_at=CASE WHEN ?='downloading' AND json_extract(metadata_json,'$.live')=1 THEN COALESCE(download_started_at,?) ELSE published_at END,
       download_started_at=CASE WHEN ?='queued' THEN NULL WHEN ?='downloading' AND download_started_at IS NULL THEN ? ELSE download_started_at END,
       download_finished_at=CASE WHEN ? IN ('queued','downloading','paused','stopping','cancelling') THEN NULL WHEN ? IN ('completed','duplicate','failed','cancelled','deleted') THEN ? ELSE download_finished_at END,
       updated_at=? WHERE id=?`)
       .run(status, values.progress ?? null, status, values.downloadedBytes ?? null, values.error ?? null, values.checksum ?? null, values.storagePath ?? null, values.duplicateOf ?? null,
-        status, status, stamp, status, status, stamp, stamp, itemId);
+        status, stamp, status, status, stamp, status, status, stamp, stamp, itemId);
     return this.getItem(itemId);
   }
 
@@ -503,7 +514,10 @@ export class Database {
   }
 
   setCanonicalMediaDate(itemId: string, publishedAt?: string) {
-    const canonical = oldestMediaDate(this.getItem(itemId)?.publishedAt, publishedAt);
+    const item = this.getItem(itemId);
+    const canonical = item?.metadata.live === true
+      ? firstMediaDate(item.downloadStartedAt, item.createdAt)
+      : oldestMediaDate(item?.publishedAt, publishedAt);
     if (canonical) this.sqlite.prepare("UPDATE items SET published_at=?,updated_at=? WHERE id=?").run(canonical, now(), itemId);
     return canonical;
   }
@@ -539,17 +553,6 @@ export class Database {
       pageUrl: row.page_url, thumbnailUrl: row.thumbnail_url ?? undefined, createdAt: row.created_at, updatedAt: row.updated_at,
     };
   }
-}
-
-function validMediaDate(value?: string): string | undefined {
-  if (!value) return undefined;
-  const date = new Date(value);
-  const year = date.getUTCFullYear();
-  return Number.isNaN(date.valueOf()) || year < 1900 || date.valueOf() > Date.now() + 86_400_000 ? undefined : date.toISOString();
-}
-
-function oldestMediaDate(...values: Array<string | undefined>): string | undefined {
-  return values.map(validMediaDate).filter((value): value is string => Boolean(value)).sort()[0];
 }
 
 function hammingDistance(left: string, right: string): number {

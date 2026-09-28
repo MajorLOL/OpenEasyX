@@ -1,3 +1,4 @@
+import { validMediaDate } from "../packages/media-date.js";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -105,9 +106,9 @@ export class DownloadQueue {
       if (!item || this.active.has(item.id)) return;
       const control: ActiveDownload = { paused: false };
       this.active.set(item.id, control);
-      this.db.setItemStatus(item.id, "downloading", { progress: 0 });
+      const startedItem = this.db.setItemStatus(item.id, "downloading", { progress: 0 })!;
       this.writeLog?.("info", "download", "Download started", { itemId: item.id, pluginId: item.pluginId, title: item.title, mediaType: item.mediaType });
-      void this.download(item, control).finally(() => this.active.delete(item.id));
+      void this.download(startedItem, control).finally(() => this.active.delete(item.id));
     }
   }
 
@@ -357,9 +358,9 @@ export class DownloadQueue {
   }
 
   private async applyMediaDate(file: string, mediaType: string, publishedAt?: string) {
-    if (!publishedAt || !fs.existsSync(file)) return;
-    const date = new Date(publishedAt);
-    if (Number.isNaN(date.valueOf())) return;
+    const normalized = validMediaDate(publishedAt);
+    if (!normalized || !fs.existsSync(file)) return;
+    const date = new Date(normalized);
     if (mediaType === "image") {
       const exifDate = date.toISOString().slice(0, 19).replace(/-/g, ":").replace("T", " ");
       try { await this.capture("exiftool", ["-overwrite_original", `-DateTimeOriginal=${exifDate}`, `-CreateDate=${exifDate}`, `-ModifyDate=${exifDate}`, `-XMP:DateCreated=${date.toISOString()}`, file]); } catch { /* Filesystem date still preserves the canonical date. */ }

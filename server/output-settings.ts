@@ -1,3 +1,4 @@
+import { firstMediaDate } from "../packages/media-date.js";
 import path from "node:path";
 import { z } from "zod";
 import type { DownloadItem } from "./database.js";
@@ -16,8 +17,9 @@ export const settingsSchema = z.object({
 
 export function downloadOutputPath(settings: Record<string, unknown>, item: DownloadItem, performer: string, site: string, originalFilename: string): string {
   const options = outputSettings(settings); const original = path.parse(originalFilename);
-  const date = new Date(item.publishedAt || item.createdAt);
-  const stamp = Number.isNaN(date.valueOf()) ? "unknown" : date.toISOString();
+  const stamp = (item.metadata.live === true
+    ? firstMediaDate(item.downloadStartedAt, item.createdAt)
+    : firstMediaDate(item.publishedAt, item.createdAt)) ?? "unknown";
   const extension = item.metadata.live === true && item.mediaType === "video" && options.recordingPreset !== "source" ? ".mp4" : original.ext;
   return renderOutputPath(options, {
     performer, site, filename: original.name, title: item.title || original.name, id: item.id,
