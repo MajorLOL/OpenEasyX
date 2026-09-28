@@ -16,6 +16,7 @@ import { BrowserLoginManager } from "./browser-login.js";
 import { LogStore, type LogWriter } from "./log-store.js";
 import { LiveCamImages } from "./live-cam-images.js";
 import { LiveCamService } from "./live-cams.js";
+import { restoreLiveCamPerformers } from "./live-cam-restore.js";
 import { PluginRepositoryManager } from "./plugin-repositories.js";
 import { LibraryDatabase } from "./library-database.js";
 import { Catalog } from "./catalog.js";
@@ -47,10 +48,10 @@ const queue = new DownloadQueue(
 const browserLogin = new BrowserLoginManager(dataDir);
 const liveCamImages = new LiveCamImages(db, plugins, path.join(dataDir, "performer-images"));
 const liveCams = new LiveCamService(db, plugins, fetch, (providerId, cam, performer) => { void liveCamImages.ensure(providerId, cam, performer); });
-for (const favorite of db.listLiveCamFavorites()) {
-  const entry = plugins.list().find((entry) => entry.manifest.id === favorite.providerId && entry.installed && entry.enabled);
-  if (entry) liveCams.createPerformer(favorite.providerId, { ...favorite, id: favorite.camId, online: false });
-}
+restoreLiveCamPerformers(db, plugins, liveCams, (error, providerId, username) => {
+  appLogger.warn({ err: error, providerId, username, scope: "live-cams",
+    ...(error instanceof PerformerConflictError ? { conflict: error.conflict } : {}) }, "Saved favorite performer could not be restored; review the performer profiles");
+});
 queue.start();
 
 const app = Fastify({ loggerInstance: appLogger, bodyLimit: 8 * 1024 * 1024 });

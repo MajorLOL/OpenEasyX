@@ -433,7 +433,11 @@ export class Database {
 
   updateSource(sourceId: string, values: Partial<Pick<Source, "pluginId" | "label" | "profileUrl" | "domain" | "enabled" | "autoDownload" | "scrapeEnabled" | "syncIntervalSeconds">> & { scraperPluginId?: string | null }) {
     const source = this.getSource(sourceId); if (!source) return undefined;
-    if (values.profileUrl !== undefined) this.assertSourceOwner(source.performerId, values.profileUrl);
+    // Refreshing an already stored account must not turn a legacy conflict into
+    // a runtime failure. New associations still require an explicit merge.
+    if (values.profileUrl !== undefined && profileIdentity(values.profileUrl) !== profileIdentity(source.profileUrl)) {
+      this.assertSourceOwner(source.performerId, values.profileUrl);
+    }
     this.sqlite.prepare("UPDATE sources SET plugin_id=?,label=?,profile_url=?,domain=?,enabled=?,auto_download=?,scraper_plugin_id=?,scrape_enabled=?,sync_interval_seconds=?,sync_interval_minutes=?,updated_at=? WHERE id=?")
       .run(values.pluginId ?? source.pluginId, values.label ?? source.label, values.profileUrl ?? source.profileUrl, values.domain ?? source.domain,
         (values.enabled ?? source.enabled) ? 1 : 0, (values.autoDownload ?? source.autoDownload) ? 1 : 0,
