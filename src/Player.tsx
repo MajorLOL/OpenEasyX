@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, Captions, Check, Clock3, Grid3X3, Heart, LoaderCircle, Maximize, Minimize, Pause, Play, Upload, Volume2, VolumeX } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Captions, Check, Clock3, Grid3X3, Heart, LoaderCircle, Maximize, Minimize, Pause, Play, RefreshCw, Upload, Volume2, VolumeX } from "lucide-react";
 import { api } from "./api";
 import { initialAutoplay, nextMediaId, PHOTO_AUTOPLAY_SECONDS } from "./playback";
 import { loadPlayerAudio, savePlayerAudio } from "./player-audio";
@@ -28,16 +28,15 @@ function bytes(value = 0) {
   const units = ["B", "KB", "MB", "GB", "TB"]; const index = value ? Math.min(4, Math.floor(Math.log(value) / Math.log(1024))) : 0;
   return `${(value / 1024 ** index).toFixed(index > 2 ? 1 : 0)} ${units[index]}`;
 }
-function safePlay(element: HTMLVideoElement) {
-  void element.play().catch(() => {});
-}
-
 export function PlayerViewer({ media, context, autoStart = false, close, favorite, advance, setNotice }: {
   media: Media; context: PlaybackContext; autoStart?: boolean; close: () => void;
   favorite: (media: Media, value: boolean) => void; advance: (media: Media) => void; setNotice: (value: string) => void;
 }) {
   const video = useRef<HTMLVideoElement>(null); const player = useRef<HTMLDivElement>(null); const lastSaved = useRef(0); const hideTimer = useRef<number | undefined>(undefined);
   const initialAudio = useRef(loadPlayerAudio());
+  const recoveryPosition = useRef<number | undefined>(undefined);
+  const [playbackError, setPlaybackError] = useState("");
+  const [retry, setRetry] = useState(0);
   const [playing, setPlaying] = useState(false); const [waiting, setWaiting] = useState(false); const [controls, setControls] = useState(true);
   const [currentTime, setCurrentTime] = useState(media.progressSeconds || 0); const [duration, setDuration] = useState(media.duration || 0); const [buffered, setBuffered] = useState(0);
   const [volume, setVolume] = useState(initialAudio.current.volume); const [muted, setMuted] = useState(initialAudio.current.muted);
@@ -47,6 +46,20 @@ export function PlayerViewer({ media, context, autoStart = false, close, favorit
   const [captionMenu, setCaptionMenu] = useState(false); const [subtitleTrack, setSubtitleTrack] = useState(() => localStorage.getItem("open-easyx.subtitle-track") || "original");
   const [subtitles, setSubtitles] = useState<SubtitleState>({ status: "disabled", progress: 0, sourceLanguage: "", error: "", tracks: [] });
   const [languages, setLanguages] = useState<Language[]>([]); const [uploadLanguage, setUploadLanguage] = useState("en"); const [uploading, setUploading] = useState(false);
+
+  const failPlayback = (message: string) => { setPlaybackError(message); setWaiting(false); setPlaying(false); video.current?.pause(); };
+  const safePlay = (element: HTMLVideoElement) => {
+    void element.play().catch((reason: unknown) => {
+      if (reason instanceof DOMException && (reason.name === "AbortError" || reason.name === "NotAllowedError")) { setWaiting(false); return; }
+      failPlayback("This video could not be played. Try again or check the file format.");
+    });
+  };
+  const reloadPlayback = () => {
+    const element = video.current; if (!element) return;
+    recoveryPosition.current = Number.isFinite(element.currentTime) ? element.currentTime : currentTime;
+    setPlaybackError(""); setWaiting(true); setPlaying(false);
+    element.load();
+  };
 
   const save = (completed = false, force = false) => {
     const element = video.current; if (!element || !Number.isFinite(element.duration)) return Promise.resolve();
@@ -79,6 +92,7 @@ export function PlayerViewer({ media, context, autoStart = false, close, favorit
   }, [media.id, media.kind]);
   useEffect(() => {
     lastSaved.current = 0; window.clearTimeout(hideTimer.current);
+    recoveryPosition.current = undefined; setPlaybackError("");
     if (media.kind === "video" && video.current) {
       video.current.src = media.streamUrl; video.current.load();
     }
@@ -108,8 +122,11 @@ export function PlayerViewer({ media, context, autoStart = false, close, favorit
   useEffect(() => {
     const element = video.current;
     if (media.kind !== "video" || !element) return;
-    return monitorVideoStalls(element);
-  }, [media.id, media.kind]);
+    return monitorVideoStalls(element, {
+      reload: reloadPlayback,
+      failed: () => failPlayback("The video image is still frozen. Try reloading the video."),
+    });
+  }, [media.id, media.kind, retry]);
   useEffect(() => {
     const element = video.current; if (!element?.textTracks) return;
     Array.from(element.textTracks).forEach((track, index) => { track.mode = subtitles.tracks[index]?.id === subtitleTrack ? "showing" : "disabled"; });
@@ -146,13 +163,15 @@ export function PlayerViewer({ media, context, autoStart = false, close, favorit
   return <article className="watch-page">
     <div className="theater-stage">{media.kind === "video" ? <div ref={player} className={`custom-player ${pageFullscreen ? "page-fullscreen" : ""} ${controls || !playing ? "controls-visible" : "controls-hidden"}`} tabIndex={0} onMouseMove={reveal} onTouchStart={reveal} onMouseLeave={() => playing && !captionMenu && setControls(false)}>
       <div className="player-surface" onClick={togglePlayback} onDoubleClick={() => void toggleFullscreen()}><video ref={video} src={media.streamUrl} poster={media.thumbnailUrl} playsInline preload="metadata" autoPlay={autoStart}
-        onLoadedMetadata={(event) => { const element = event.currentTarget; setDuration(element.duration || media.duration || 0); element.volume = initialAudio.current.volume; element.muted = initialAudio.current.muted; element.currentTime = 0; if (!media.completed && media.progressSeconds > 0 && media.progressSeconds < element.duration - 5) element.currentTime = media.progressSeconds; if (autoStart && element.paused) safePlay(element); }}
+        onLoadedMetadata={(event) => { const element = event.currentTarget; const resumeAt = recoveryPosition.current; recoveryPosition.current = undefined; setDuration(element.duration || media.duration || 0); element.volume = initialAudio.current.volume; element.muted = initialAudio.current.muted; element.currentTime = resumeAt !== undefined ? Math.min(resumeAt, Number.isFinite(element.duration) ? Math.max(0, element.duration - 0.1) : resumeAt) : !media.completed && media.progressSeconds > 0 && media.progressSeconds < element.duration - 5 ? media.progressSeconds : 0; if ((resumeAt !== undefined || autoStart) && element.paused) safePlay(element); }}
+        onError={(event) => { const code = event.currentTarget.error?.code; failPlayback(code === 3 || code === 4 ? "This video could not be decoded. Its format may not be supported by this browser." : "The video could not be loaded. Check the connection and try again."); }}
         onTimeUpdate={(event) => { setCurrentTime(event.currentTarget.currentTime); void save(); }} onProgress={(event) => { const element = event.currentTarget; if (element.buffered.length) setBuffered(element.buffered.end(element.buffered.length - 1)); }}
-        onPlay={() => { setPlaying(true); setWaiting(false); reveal(); }} onPlaying={() => { setPlaying(true); setWaiting(false); }} onPause={() => { setPlaying(false); setWaiting(false); void save(false, true); }} onWaiting={() => setWaiting(true)} onCanPlay={() => setWaiting(false)}
+        onPlay={() => { setPlaying(true); reveal(); }} onPlaying={() => { setPlaying(true); setWaiting(false); setPlaybackError(""); }} onPause={() => { setPlaying(false); setWaiting(false); void save(false, true); }} onWaiting={() => setWaiting(true)} onCanPlay={() => setWaiting(false)}
         onVolumeChange={(event) => { setVolume(event.currentTarget.volume); setMuted(event.currentTarget.muted); initialAudio.current = { volume: event.currentTarget.volume, muted: event.currentTarget.muted }; savePlayerAudio(initialAudio.current); }} onEnded={() => void next()}>
         {subtitles.tracks.map((track) => <track key={`${track.id}-${track.url}`} kind="subtitles" src={track.url} srcLang={track.language} label={track.label}/>)}
       </video></div>
-      {waiting && <div className="player-buffering"><LoaderCircle className="spin"/></div>}{!playing && !waiting && <button className="player-center-play" onClick={togglePlayback} aria-label="Play"><Play fill="currentColor"/></button>}
+      {playbackError && <div className="player-error" role="alert"><AlertTriangle/><b>Video playback interrupted</b><span>{playbackError}</span><button className="quiet" onClick={() => { reloadPlayback(); setRetry((value) => value + 1); }}><RefreshCw/>Try again</button></div>}
+      {waiting && !playbackError && <div className="player-buffering"><LoaderCircle className="spin"/></div>}{!playing && !waiting && !playbackError && <button className="player-center-play" onClick={togglePlayback} aria-label="Play"><Play fill="currentColor"/></button>}
       <div className="player-controls" onClick={(event) => event.stopPropagation()}><div className="player-timeline"><span className="player-buffered" style={{ width: `${bufferedProgress}%` }}/><span className="player-elapsed" style={{ width: `${progress}%` }}/><input type="range" min="0" max={duration || 0} step="0.1" value={Math.min(currentTime, duration || 0)} onChange={(event) => seek(Number(event.target.value))} aria-label="Video position"/></div>
         <div className="player-control-row"><div className="player-controls-left"><button className="player-icon-button" onClick={togglePlayback} aria-label={playing ? "Pause" : "Play"}>{playing ? <Pause fill="currentColor"/> : <Play fill="currentColor"/>}</button><div className="player-volume"><button className="player-icon-button" onClick={toggleMute}>{muted || volume === 0 ? <VolumeX/> : <Volume2/>}</button><input type="range" min="0" max="1" step="0.05" value={muted ? 0 : volume} onChange={(event) => { const element = video.current; if (!element) return; element.volume = Number(event.target.value); element.muted = element.volume === 0; }}/></div><span className="player-time"><b>{playerTime(currentTime)}</b><i>/</i><span>{playerTime(duration)}</span></span></div>
           <div className="player-controls-right"><button className={`player-autoplay ${autoplay ? "active" : ""}`} aria-label="Autoplay" aria-pressed={autoplay} onClick={toggleAutoplay}><span>Auto</span><i/></button>
