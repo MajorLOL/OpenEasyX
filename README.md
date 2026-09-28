@@ -45,6 +45,14 @@ Active transfers stay below `/media/.downloads` and are never exposed to the lib
 
 Live creator favorites are saved locally immediately. Connected-provider synchronization runs in the background with a visible status, and pending changes survive restarts and retry during account synchronization. A provider outage or expired login does not discard a saved local favorite.
 
+## Performer accounts and rescanning
+
+Account URLs cannot be assigned to different performers without review. Adding an already linked Instagram account (including URL case, tracking parameters, or a trailing slash) shows the existing profile and offers **Review merge**. Choose which name to keep, then explicitly confirm. Sources, stored files, favorites, and playback history are retained; the other name becomes an alias. Existing conflicting links also appear on the performer profile. Active scans/downloads must finish before merging.
+
+Each source has a **Hard refresh** button beside **Scrape now**. It rescans from the beginning within the plugin's configured scan limit and restores rediscovered deleted or missing items, following the source/global auto-download settings. Existing files and active downloads are preserved. Normal automatic scans continue to respect deletion history; hard refresh affects the selected source only.
+
+Pornhub account scans use the account's uploads listing (channel video listing for channels) and verify the uploader of each candidate before queuing it. Unrelated recommendations, cast-only matches, and videos whose uploader cannot be verified are skipped. Verification also applies to older queued account videos before downloading. Checking metadata makes account scans slower than a flat playlist scan.
+
 ## Chaturbate recording quality and connectivity
 
 In **Plugins → Chaturbate Live**, set **Maximum recording height** to `720` (or `480`, `1080`) to capture a native stream at or below that resolution. `0` selects the best available quality. Separate audio and video tracks are captured together with FFmpeg. If the provider has no matching resolution with audio, the recording fails instead of silently selecting a larger stream.

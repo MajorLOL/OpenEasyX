@@ -1,11 +1,13 @@
 import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
-import { asJson, id, now } from "./utils.js";
+import { asJson, id, now, safeSegment } from "./utils.js";
 import type { MediaCandidate, PersonCandidate, SourceCandidate } from "../packages/plugin-sdk/index.js";
 import { firstMediaDate, oldestMediaDate, validMediaDate } from "../packages/media-date.js";
 import { outputDefaults } from "../packages/output-settings.js";
 import type { VideoFingerprint } from "./video-matching.js";
+import { profileIdentity, type PerformerConflict } from "../packages/profile-identity.js";
+import { PerformerConflictError } from "./performer-conflict.js";
 
 export type Performer = {
   id: string; name: string; aliases: string[]; imageUrl?: string; externalRefs: Record<string, string>;
@@ -71,6 +73,15 @@ export class Database {
         image_url TEXT, external_refs_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
       CREATE UNIQUE INDEX IF NOT EXISTS performers_name_unique ON performers(name COLLATE NOCASE);
+      CREATE TABLE IF NOT EXISTS performer_identities (
+        performer_id TEXT NOT NULL REFERENCES performers(id) ON DELETE CASCADE,
+        plugin_id TEXT NOT NULL, external_id TEXT NOT NULL,
+        PRIMARY KEY(performer_id,plugin_id,external_id)
+      );
+      CREATE TABLE IF NOT EXISTS performer_redirects (
+        name TEXT PRIMARY KEY COLLATE NOCASE,
+        performer_id TEXT NOT NULL REFERENCES performers(id) ON DELETE CASCADE
+      );
       CREATE TABLE IF NOT EXISTS sources (
         id TEXT PRIMARY KEY, performer_id TEXT NOT NULL REFERENCES performers(id) ON DELETE CASCADE,
         plugin_id TEXT NOT NULL, external_id TEXT NOT NULL, label TEXT NOT NULL, profile_url TEXT NOT NULL,
@@ -111,6 +122,13 @@ export class Database {
       );
     `);
     const sourceColumns = new Set((this.sqlite.prepare("PRAGMA table_info(sources)").all() as Array<{ name: string }>).map((column) => column.name));
+    if (!sourceColumns.has("profile_key")) this.sqlite.exec("ALTER TABLE sources ADD COLUMN profile_key TEXT");
+    for (const source of this.sqlite.prepare("SELECT id,profile_url FROM sources WHERE profile_key IS NULL").all() as Array<{ id: string; profile_url: string }>) {
+      this.sqlite.prepare("UPDATE sources SET profile_key=? WHERE id=?").run(profileIdentity(source.profile_url) ?? null, source.id);
+    }
+    this.sqlite.exec("CREATE INDEX IF NOT EXISTS sources_profile_key_idx ON sources(profile_key,performer_id)");
+    this.sqlite.exec(`INSERT OR IGNORE INTO performer_identities(performer_id,plugin_id,external_id)
+      SELECT p.id,j.key,j.value FROM performers p,json_each(p.external_refs_json) j WHERE j.type='text'`);
     if (!sourceColumns.has("scraper_plugin_id")) this.sqlite.exec("ALTER TABLE sources ADD COLUMN scraper_plugin_id TEXT");
     if (!sourceColumns.has("scrape_enabled")) this.sqlite.exec("ALTER TABLE sources ADD COLUMN scrape_enabled INTEGER NOT NULL DEFAULT 0");
     if (!sourceColumns.has("sync_interval_seconds")) {
@@ -118,6 +136,7 @@ export class Database {
       this.sqlite.exec("UPDATE sources SET sync_interval_seconds=sync_interval_minutes*60");
     }
     const itemColumns = new Set((this.sqlite.prepare("PRAGMA table_info(items)").all() as Array<{ name: string }>).map((column) => column.name));
+    if (!itemColumns.has("original_external_id")) this.sqlite.exec("ALTER TABLE items ADD COLUMN original_external_id TEXT");
     if (!itemColumns.has("visual_hash")) this.sqlite.exec("ALTER TABLE items ADD COLUMN visual_hash TEXT");
     if (!itemColumns.has("download_started_at")) this.sqlite.exec("ALTER TABLE items ADD COLUMN download_started_at TEXT");
     if (!itemColumns.has("download_finished_at")) this.sqlite.exec("ALTER TABLE items ADD COLUMN download_finished_at TEXT");
@@ -265,7 +284,37 @@ export class Database {
     return row ? this.mapPerformer(row) : undefined;
   }
 
+  resolvePerformerName(name: string): string {
+    const row = this.sqlite.prepare("SELECT p.name FROM performer_redirects r JOIN performers p ON p.id=r.performer_id WHERE r.name=? COLLATE NOCASE").get(name) as { name: string } | undefined;
+    return row?.name ?? name;
+  }
+
+  findPerformerByIdentity(pluginId: string, externalId: string): Performer | undefined {
+    const row = this.sqlite.prepare("SELECT p.* FROM performer_identities i JOIN performers p ON p.id=i.performer_id WHERE i.plugin_id=? AND i.external_id=? LIMIT 1").get(pluginId, externalId) as any;
+    return row ? this.mapPerformer(row) : undefined;
+  }
+
+  sourceConflicts(performerId: string, profileUrl?: string): PerformerConflict[] {
+    const keys = profileUrl === undefined
+      ? this.listSources(performerId).map((source) => ({ key: profileIdentity(source.profileUrl), url: source.profileUrl }))
+      : [{ key: profileIdentity(profileUrl), url: profileUrl }];
+    const conflicts = new Map<string, PerformerConflict>();
+    for (const { key, url } of keys) {
+      if (!key) continue;
+      const rows = this.sqlite.prepare("SELECT DISTINCT p.id,p.name FROM sources s JOIN performers p ON p.id=s.performer_id WHERE s.profile_key=? AND p.id<>?").all(key, performerId) as Array<{ id: string; name: string }>;
+      for (const existingPerformer of rows) conflicts.set(existingPerformer.id, { performerId, existingPerformer, profileUrl: url });
+    }
+    return [...conflicts.values()];
+  }
+
+  private assertSourceOwner(performerId: string, profileUrl: string) {
+    const conflict = this.sourceConflicts(performerId, profileUrl)[0];
+    if (conflict) throw new PerformerConflictError(conflict);
+  }
+
   createPerformer(values: PerformerInput): Performer {
+    const mergedName = this.resolvePerformerName(values.name);
+    if (mergedName !== values.name) throw Object.assign(new Error(`This name belongs to the merged profile ${mergedName}`), { statusCode: 409 });
     const performerId = id("person"); const stamp = now();
     this.sqlite.prepare("INSERT INTO performers VALUES(?,?,?,?,?,?,?)")
       .run(performerId, values.name, JSON.stringify(values.aliases ?? []), values.imageUrl ?? null, "{}", stamp, stamp);
@@ -284,21 +333,73 @@ export class Database {
     return this.sqlite.prepare("DELETE FROM performers WHERE id=?").run(performerId).changes > 0;
   }
 
+  performerMergePreview(fromId: string, targetId: string) {
+    if (fromId === targetId) throw Object.assign(new Error("Choose two different performers"), { statusCode: 400 });
+    const from = this.getPerformer(fromId); const target = this.getPerformer(targetId);
+    if (!from || !target) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
+    const counts = (performer: Performer) => ({ id: performer.id, name: performer.name,
+      sources: this.listSources(performer.id).length,
+      files: Number((this.sqlite.prepare("SELECT count(*) n FROM items WHERE performer_id=? AND storage_path IS NOT NULL").get(performer.id) as any).n) });
+    const active = this.sqlite.prepare("SELECT id FROM items WHERE performer_id IN (?,?) AND status IN ('downloading','paused','stopping','cancelling') LIMIT 1").get(fromId, targetId);
+    return { from: counts(from), target: counts(target), blocked: !!active };
+  }
+
+  mergePerformers(fromId: string, targetId: string, imageUrl?: string) {
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      const preview = this.performerMergePreview(fromId, targetId);
+      if (preview.blocked) throw Object.assign(new Error("Finish or cancel active downloads for both performers before merging"), { statusCode: 409 });
+      const from = this.getPerformer(fromId)!; const target = this.getPerformer(targetId)!;
+      const aliases = [...new Set([...target.aliases, from.name, ...from.aliases])].filter((name) => name.toLowerCase() !== target.name.toLowerCase());
+      this.sqlite.prepare("UPDATE performers SET aliases_json=?,external_refs_json=?,image_url=?,updated_at=? WHERE id=?")
+        .run(JSON.stringify(aliases), JSON.stringify({ ...from.externalRefs, ...target.externalRefs }), target.imageUrl ?? imageUrl ?? from.imageUrl ?? null, now(), targetId);
+      this.sqlite.prepare("INSERT OR IGNORE INTO performer_identities SELECT ?,plugin_id,external_id FROM performer_identities WHERE performer_id=?").run(targetId, fromId);
+      this.sqlite.prepare("UPDATE items SET performer_id=? WHERE performer_id=?").run(targetId, fromId);
+      for (const source of this.listSources(fromId)) {
+        const same = this.sqlite.prepare("SELECT id FROM sources WHERE performer_id=? AND plugin_id=? AND (external_id=? OR (profile_key IS NOT NULL AND profile_key=?)) ORDER BY created_at LIMIT 1")
+          .get(targetId, source.pluginId, source.externalId, profileIdentity(source.profileUrl) ?? null) as { id: string } | undefined;
+        if (!same) this.sqlite.prepare("UPDATE sources SET performer_id=?,updated_at=? WHERE id=?").run(targetId, now(), source.id);
+        else {
+          // Keep every item ID and storage path, including two already stored
+          // variants of the same external ID. The resolver still sees its original ID.
+          for (const item of this.sqlite.prepare("SELECT id,external_id FROM items WHERE source_id=?").all(source.id) as Array<{ id: string; external_id: string }>) {
+            const collision = this.sqlite.prepare("SELECT id FROM items WHERE source_id=? AND external_id=?").get(same.id, item.external_id);
+            if (collision) this.sqlite.prepare("UPDATE items SET original_external_id=COALESCE(original_external_id,external_id),external_id=? WHERE id=?")
+              .run(`merged:${item.id}`, item.id);
+          }
+          this.sqlite.prepare("UPDATE items SET source_id=? WHERE source_id=?").run(same.id, source.id);
+          this.sqlite.prepare("DELETE FROM sources WHERE id=?").run(source.id);
+        }
+      }
+      this.sqlite.prepare("UPDATE performer_redirects SET performer_id=? WHERE performer_id=?").run(targetId, fromId);
+      this.sqlite.prepare("INSERT INTO performer_redirects(name,performer_id) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET performer_id=excluded.performer_id").run(from.name, targetId);
+      if (safeSegment(from.name) !== from.name && !this.getPerformerByName(safeSegment(from.name))) this.sqlite.prepare("INSERT INTO performer_redirects(name,performer_id) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET performer_id=excluded.performer_id").run(safeSegment(from.name), targetId);
+      this.sqlite.prepare("DELETE FROM performers WHERE id=?").run(fromId);
+      this.sqlite.exec("COMMIT");
+      return { performer: this.getPerformer(targetId)!, previousName: from.name };
+    } catch (error) { this.sqlite.exec("ROLLBACK"); throw error; }
+  }
+
   upsertPerformer(candidate: PersonCandidate, pluginId: string, targetPerformerId?: string): Performer {
+    const owner = this.findPerformerByIdentity(pluginId, candidate.externalId);
     const existing = (targetPerformerId
       ? this.sqlite.prepare("SELECT * FROM performers WHERE id=?").get(targetPerformerId)
-      : this.sqlite.prepare("SELECT * FROM performers WHERE name=? COLLATE NOCASE").get(candidate.name)) as any;
+      : this.sqlite.prepare("SELECT * FROM performers WHERE name=? COLLATE NOCASE").get(this.resolvePerformerName(candidate.name))
+        ?? (owner ? this.sqlite.prepare("SELECT * FROM performers WHERE id=?").get(owner.id) : undefined)) as any;
+    if (owner && existing && owner.id !== existing.id) throw new PerformerConflictError({ performerId: existing.id, existingPerformer: owner, profileUrl: candidate.profileUrls?.[0] });
     const stamp = now();
     if (existing) {
-      const aliases = [...new Set([...asJson<string[]>(existing.aliases_json, []), ...(candidate.aliases ?? [])])];
+      const aliases = [...new Set([...asJson<string[]>(existing.aliases_json, []), ...(candidate.aliases ?? []), ...(candidate.name.toLowerCase() !== existing.name.toLowerCase() ? [candidate.name] : [])])];
       const refs = { ...asJson<Record<string, string>>(existing.external_refs_json, {}), [pluginId]: candidate.externalId };
       this.sqlite.prepare("UPDATE performers SET aliases_json=?, image_url=COALESCE(?,image_url), external_refs_json=?, updated_at=? WHERE id=?")
         .run(JSON.stringify(aliases), candidate.imageUrl ?? null, JSON.stringify(refs), stamp, existing.id);
+      this.sqlite.prepare("INSERT OR IGNORE INTO performer_identities VALUES(?,?,?)").run(existing.id, pluginId, candidate.externalId);
       return this.getPerformer(existing.id)!;
     }
     const performerId = id("person");
     this.sqlite.prepare("INSERT INTO performers VALUES(?,?,?,?,?,?,?)")
       .run(performerId, candidate.name, JSON.stringify(candidate.aliases ?? []), candidate.imageUrl ?? null, JSON.stringify({ [pluginId]: candidate.externalId }), stamp, stamp);
+    this.sqlite.prepare("INSERT OR IGNORE INTO performer_identities VALUES(?,?,?)").run(performerId, pluginId, candidate.externalId);
     return this.getPerformer(performerId)!;
   }
 
@@ -308,11 +409,13 @@ export class Database {
   }
 
   addSource(performerId: string, pluginId: string, candidate: SourceCandidate): Source {
+    this.assertSourceOwner(performerId, candidate.profileUrl);
     const sourceId = id("source"); const stamp = now();
     this.sqlite.prepare(`INSERT INTO sources(id,performer_id,plugin_id,external_id,label,profile_url,domain,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(performer_id,plugin_id,external_id) DO UPDATE SET label=excluded.label,profile_url=excluded.profile_url,domain=excluded.domain,updated_at=excluded.updated_at`)
       .run(sourceId, performerId, pluginId, candidate.externalId, candidate.label, candidate.profileUrl, candidate.domain, stamp, stamp);
     const row = this.sqlite.prepare("SELECT * FROM sources WHERE performer_id=? AND plugin_id=? AND external_id=?").get(performerId, pluginId, candidate.externalId) as any;
+    this.sqlite.prepare("UPDATE sources SET profile_key=? WHERE id=?").run(profileIdentity(candidate.profileUrl) ?? null, row.id);
     return this.mapSource(row);
   }
 
@@ -330,12 +433,14 @@ export class Database {
 
   updateSource(sourceId: string, values: Partial<Pick<Source, "pluginId" | "label" | "profileUrl" | "domain" | "enabled" | "autoDownload" | "scrapeEnabled" | "syncIntervalSeconds">> & { scraperPluginId?: string | null }) {
     const source = this.getSource(sourceId); if (!source) return undefined;
+    if (values.profileUrl !== undefined) this.assertSourceOwner(source.performerId, values.profileUrl);
     this.sqlite.prepare("UPDATE sources SET plugin_id=?,label=?,profile_url=?,domain=?,enabled=?,auto_download=?,scraper_plugin_id=?,scrape_enabled=?,sync_interval_seconds=?,sync_interval_minutes=?,updated_at=? WHERE id=?")
       .run(values.pluginId ?? source.pluginId, values.label ?? source.label, values.profileUrl ?? source.profileUrl, values.domain ?? source.domain,
         (values.enabled ?? source.enabled) ? 1 : 0, (values.autoDownload ?? source.autoDownload) ? 1 : 0,
         values.scraperPluginId === undefined ? source.scraperPluginId ?? null : values.scraperPluginId,
         (values.scrapeEnabled ?? source.scrapeEnabled) ? 1 : 0, values.syncIntervalSeconds ?? source.syncIntervalSeconds,
         Math.max(1, Math.round((values.syncIntervalSeconds ?? source.syncIntervalSeconds) / 60)), now(), sourceId);
+    if (values.profileUrl !== undefined) this.sqlite.prepare("UPDATE sources SET profile_key=? WHERE id=?").run(profileIdentity(values.profileUrl) ?? null, sourceId);
     return this.getSource(sourceId);
   }
 
@@ -364,7 +469,30 @@ export class Database {
       syncIntervalSeconds: row.sync_interval_seconds ?? row.sync_interval_minutes * 60, lastSyncedAt: row.last_synced_at ?? undefined, nextSyncAt: row.next_sync_at ?? undefined, lastError: row.last_error ?? undefined };
   }
 
-  ingestItems(source: Source, candidates: MediaCandidate[], onStoredDateChange?: (itemId: string, publishedAt: string) => void): { added: number; upgraded: number; skipped: number } {
+  /** Explicitly reconsider rediscovered missing media; ordinary scans keep deletion history. */
+  hardRefreshItems(source: Source, candidates: MediaCandidate[], hasStoredFile: (item: DownloadItem) => boolean, onStoredDateChange?: (itemId: string, publishedAt: string) => void) {
+    let recovered = 0;
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      for (const candidate of candidates) {
+        const item = this.getItemBySourceExternalId(source.id, candidate.externalId);
+        if (!item || !["completed", "deleted", "failed", "cancelled", "duplicate", "superseded"].includes(item.status) || hasStoredFile(item)) continue;
+        const original = item.duplicateOf ? this.getItem(item.duplicateOf) : undefined;
+        if (original && hasStoredFile(original)) continue;
+        this.sqlite.prepare(`UPDATE items SET status=?,progress=0,downloaded_bytes=0,error=NULL,checksum_sha256=NULL,visual_hash=NULL,storage_path=NULL,duplicate_of=NULL,duplicate_reason=NULL,
+          download_started_at=NULL,download_finished_at=NULL,metadata_json=?,page_url=?,filename=?,title=?,updated_at=? WHERE id=?`)
+          .run(source.autoDownload || this.getSettings().autoQueueDiscovered ? "queued" : "available", JSON.stringify(candidate.metadata ?? {}), candidate.pageUrl ?? null,
+            candidate.filename ?? null, candidate.title ?? null, now(), item.id);
+        this.sqlite.prepare("DELETE FROM video_fingerprints WHERE item_id=?").run(item.id);
+        recovered++;
+      }
+      const result = this.ingestItems(source, candidates, onStoredDateChange, true);
+      this.sqlite.exec("COMMIT");
+      return { ...result, recovered };
+    } catch (error) { this.sqlite.exec("ROLLBACK"); throw error; }
+  }
+
+  ingestItems(source: Source, candidates: MediaCandidate[], onStoredDateChange?: (itemId: string, publishedAt: string) => void, ignoreDeletedHistory = false): { added: number; upgraded: number; skipped: number } {
     let added = 0, upgraded = 0, skipped = 0; const autoGlobal = !!this.getSettings().autoQueueDiscovered;
     for (const candidate of candidates) {
       let canonicalDate = candidate.metadata?.live === true ? now() : validMediaDate(candidate.publishedAt);
@@ -381,8 +509,8 @@ export class Database {
       }
       if (candidate.identityKey) {
         const deleted = this.sqlite.prepare("SELECT id FROM items WHERE performer_id=? AND identity_key=? AND status='deleted' LIMIT 1").get(source.performerId, candidate.identityKey);
-        if (deleted) { skipped++; continue; }
-        const best = this.sqlite.prepare("SELECT id,quality_score,status,published_at,storage_path FROM items WHERE performer_id=? AND identity_key=? AND status NOT IN ('failed','superseded') ORDER BY quality_score DESC LIMIT 1").get(source.performerId, candidate.identityKey) as any;
+        if (deleted && !ignoreDeletedHistory) { skipped++; continue; }
+        const best = this.sqlite.prepare("SELECT id,quality_score,status,published_at,storage_path FROM items WHERE performer_id=? AND identity_key=? AND status NOT IN ('failed','superseded') AND (?=0 OR status NOT IN ('deleted','cancelled','duplicate')) ORDER BY quality_score DESC LIMIT 1").get(source.performerId, candidate.identityKey, ignoreDeletedHistory ? 1 : 0) as any;
         canonicalDate = oldestMediaDate(best?.published_at, canonicalDate);
         if (best && Number(best.quality_score) >= (candidate.qualityScore ?? 0)) {
           if (canonicalDate && canonicalDate !== best.published_at) {
@@ -572,7 +700,7 @@ export class Database {
   }
 
   private mapItem(row: any): DownloadItem {
-    return { id: row.id, performerId: row.performer_id, sourceId: row.source_id, pluginId: row.plugin_id, externalId: row.external_id,
+    return { id: row.id, performerId: row.performer_id, sourceId: row.source_id, pluginId: row.plugin_id, externalId: row.original_external_id ?? row.external_id,
       identityKey: row.identity_key ?? undefined, title: row.title ?? undefined, pageUrl: row.page_url ?? undefined, mediaType: row.media_type,
       filename: row.filename ?? undefined, qualityScore: row.quality_score, expectedBytes: row.expected_bytes ?? undefined, publishedAt: row.published_at ?? undefined,
       metadata: asJson(row.metadata_json, {}), status: row.status, progress: row.progress, downloadedBytes: Number(row.downloaded_bytes ?? 0), checksumSha256: row.checksum_sha256 ?? undefined, visualHash: row.visual_hash ?? undefined,

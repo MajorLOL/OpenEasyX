@@ -126,7 +126,6 @@ describe("DownloadQueue", () => {
     for (const item of db.listItems()) db.setItemStatus(item.id, "queued");
     const queue = new DownloadQueue(db, manager, mediaDir); queue.start();
     await waitFor(() => db.listItems().every((item) => ["completed", "duplicate"].includes(item.status)));
-    queue.stop(); server.close();
     expect(db.listItems().filter((item) => item.status === "completed")).toHaveLength(1);
     expect(db.listItems().filter((item) => item.status === "duplicate")).toHaveLength(1);
     const completed = db.listItems().find((item) => item.status === "completed")!;
@@ -135,7 +134,16 @@ describe("DownloadQueue", () => {
     expect(files).toHaveLength(1);
     expect(fs.statSync(path.join(mediaDir, "A-B Performer", "example.test", files[0])).mtime.toISOString()).toBe("2020-01-01T00:00:00.000Z");
     expect(fs.readdirSync(path.join(mediaDir, ".downloads"))).toEqual([]);
+    // A stale completed row must not discard a replacement after a disk-side deletion.
+    fs.unlinkSync(path.join(mediaDir, completed.storagePath!));
+    db.ingestItems(source, [{ externalId: "replacement", mediaType: "image", filename: "replacement.jpg", metadata: { url } }]);
+    const replacement = db.getItemBySourceExternalId(source.id, "replacement")!;
+    await waitFor(() => ["completed", "duplicate", "failed"].includes(db.getItem(replacement.id)!.status));
+    queue.stop(); server.close();
+    expect(db.getItem(replacement.id)?.status).toBe("completed");
+    expect(fs.readFileSync(path.join(mediaDir, db.getItem(replacement.id)!.storagePath!), "utf8")).toBe("hello media");
   });
+
 
   it("accepts trusted command-based extractor downloads", async () => {
     const dataDir = temp("easyx-command-data"); const mediaDir = temp("easyx-command-media"); const pluginDir = temp("easyx-command-plugins");

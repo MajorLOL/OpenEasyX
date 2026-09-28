@@ -95,6 +95,7 @@ export class Catalog {
     readonly dataDir: string,
     readonly eagerThumbnails = process.env.NODE_ENV !== "test" && process.env.EASYX_EAGER_THUMBNAILS !== "false",
     private readonly storedMetadata?: (relativePath: string) => Record<string, unknown>,
+    private readonly resolvePerformerName: (name: string) => string = (name) => name,
   ) {
     fs.mkdirSync(mediaRoot, { recursive: true });
     fs.mkdirSync(path.join(dataDir, "thumbnails"), { recursive: true, mode: 0o700 });
@@ -139,7 +140,7 @@ export class Catalog {
               metadata.datePublished, metadata.date, metadata.created_at)) ?? fallbackDate;
           this.db.upsertMedia({
             id,
-            relativePath, kind, title: titleValue || cleanTitle(relativePath), performer: performerValue || (parts.length > 1 ? parts[0] : "Unsorted"),
+            relativePath, kind, title: titleValue || cleanTitle(relativePath), performer: this.resolvePerformerName(performerValue || (parts.length > 1 ? parts[0] : "Unsorted")),
             source: sourceDomain(sourceValue || (parts.length > 2 ? parts[1] : "")), extension, mimeType: MIMES[extension] ?? "application/octet-stream",
             size: stat.size, modifiedAt: stat.mtime.toISOString(),
             addedAt: firstMediaDate(stat.birthtime.toISOString(), metadata.downloadedAt) ?? fallbackDate, mediaDate,

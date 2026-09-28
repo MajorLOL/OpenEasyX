@@ -208,7 +208,7 @@ export class DownloadQueue {
         const duplicate = (item.identityKey ? this.db.findByIdentity(item.identityKey, item.id, item.performerId) : undefined)
           ?? this.db.findByChecksum(checksum, item.id, item.performerId)
           ?? (visual ? this.db.findVisualDuplicate(visual.hash, item.id, item.performerId, item.mediaType) : undefined);
-        if (duplicate) {
+        if (duplicate?.storagePath && fs.existsSync(path.join(this.mediaRoot, duplicate.storagePath))) {
           const canonicalDate = this.db.setCanonicalMediaDate(duplicate.id, item.publishedAt);
           if (qualityScore <= duplicate.qualityScore) {
             fs.unlinkSync(temporary); temporary = "";

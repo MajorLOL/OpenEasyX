@@ -21,6 +21,9 @@ import { LibraryDatabase } from "./library-database.js";
 import { Catalog } from "./catalog.js";
 import { registerLibraryRoutes } from "./library-routes.js";
 import { settingsSchema } from "./output-settings.js";
+import { SourceSync } from "./source-sync.js";
+import { PerformerConflictError } from "./performer-conflict.js";
+import { registerPerformerMergeRoutes } from "./performer-merge-routes.js";
 
 const port = Number(process.env.PORT ?? 3210);
 const dataDir = path.resolve(process.env.EASYX_DATA_DIR ?? "data");
@@ -33,7 +36,7 @@ const appLogger = pino({ level: process.env.EASYX_LOG_LEVEL ?? "info" }, logStor
 const writeLog: LogWriter = (level, scope, message, details) => appLogger[level]({ scope, ...(details === undefined ? {} : { details }) }, message);
 const db = new Database(dataDir);
 const libraryDb = new LibraryDatabase(dataDir);
-const catalog = new Catalog(libraryDb, mediaDir, dataDir, undefined, (relativePath) => db.storedMediaMetadata(relativePath));
+const catalog = new Catalog(libraryDb, mediaDir, dataDir, undefined, (relativePath) => db.storedMediaMetadata(relativePath), (name) => db.resolvePerformerName(name));
 const pluginRepositories = new PluginRepositoryManager(dataDir, path.resolve("plugins"), externalPluginsDir);
 const plugins = new PluginManager(db, pluginRepositories.roots(), path.join(dataDir, "sessions"), writeLog);
 await plugins.load();
@@ -52,6 +55,11 @@ queue.start();
 
 const app = Fastify({ loggerInstance: appLogger, bodyLimit: 8 * 1024 * 1024 });
 const discoveryStatus = { running: false, completed: 0, total: 0, progress: 0, query: "", error: "" };
+const performerOperations = new Set<string>();
+function beginPerformerOperation(id: string) {
+  if (performerOperations.has(id)) throw Object.assign(new Error("This performer is already being refreshed"), { statusCode: 409 });
+  performerOperations.add(id);
+}
 const performerRefreshStatus = { running: false, completed: 0, total: 0, progress: 0, error: "" };
 
 function refreshLiveCamFavorites(providerId?: string) {
@@ -69,11 +77,14 @@ app.setErrorHandler((error, request, reply) => {
   const status = typeof (error as { statusCode?: unknown }).statusCode === "number" ? Number((error as { statusCode: number }).statusCode) : 500;
   const message = error instanceof Error ? error.message : String(error);
   app.log[status >= 500 ? "error" : "warn"]({ err: error, method: request.method, url: request.url, scope: "http" }, "Request failed");
-  reply.status(status >= 400 && status < 600 ? status : 500).send({ error: message });
+  reply.status(status >= 400 && status < 600 ? status : 500).send({ error: message,
+    ...(error instanceof PerformerConflictError ? { code: error.code, conflict: error.conflict } : {}) });
 });
 
 await app.register(fastifyHttpProxy, { upstream: "http://127.0.0.1:6080", prefix: "/browser", websocket: true });
 const library = registerLibraryRoutes(app, libraryDb, catalog, db, dataDir);
+const sourceSync = new SourceSync(db, mediaDir, ensureScraperPlugin, (id) => plugins.context(id), (ids) => queue.applyStoredMediaDates(ids));
+registerPerformerMergeRoutes(app, db, libraryDb, dataDir, (id) => performerOperations.has(id) || performerRefreshStatus.running || discoveryStatus.running || db.listSources(id).some((source) => sourceSync.active.has(source.id)));
 
 app.get("/api/health", async () => ({ ok: true, product: "Open EasyX", version: appVersion, plugins: plugins.list().length, library: libraryDb.stats().total, scan: catalog.status }));
 app.get("/api/version", async () => ({ version: appVersion }));
@@ -364,13 +375,15 @@ app.post<{ Body: unknown }>("/api/performers/import", async (request) => {
   for (const match of body.matches) {
     const plugin = plugins.get(match.pluginId);
     performer = db.upsertPerformer(match.candidate, match.pluginId, performer?.id);
+    beginPerformerOperation(performer.id);
     try {
       const discovered = plugin.discoverSources ? await plugin.discoverSources(plugins.context(match.pluginId), performer) : [];
       for (const source of discovered) sources.push(db.addSource(performer.id, match.pluginId, source));
       providers.push({ pluginId: match.pluginId, ok: true });
     } catch (error) {
+      if (error instanceof PerformerConflictError) throw error;
       providers.push({ pluginId: match.pluginId, ok: false, error: error instanceof Error ? error.message : String(error) });
-    }
+    } finally { performerOperations.delete(performer.id); }
   }
   if (performer) ensurePerformerDirectory(mediaDir, performer.name);
   return { performer, sources, providers };
@@ -410,6 +423,8 @@ app.patch<{ Params: { id: string }; Body: unknown }>("/api/performers/:id", asyn
 async function refreshPerformer(performerId: string) {
   let performer = db.getPerformer(performerId);
   if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
+  beginPerformerOperation(performerId);
+  try {
   const providers: Array<{ pluginId: string; ok: boolean; error?: string }> = [];
   const sources = [];
   for (const [pluginId, externalId] of Object.entries(performer.externalRefs)) {
@@ -435,11 +450,13 @@ async function refreshPerformer(performerId: string) {
       }
       providers.push({ pluginId, ok: true });
     } catch (error) {
+      if (error instanceof PerformerConflictError) throw error;
       providers.push({ pluginId, ok: false, error: error instanceof Error ? error.message : String(error) });
     }
   }
   ensurePerformerDirectory(mediaDir, performer.name);
   return { performer, sources, providers };
+  } finally { performerOperations.delete(performerId); }
 }
 
 app.get("/api/performers/refresh/status", async () => performerRefreshStatus);
@@ -469,6 +486,8 @@ app.post<{ Params: { id: string } }>("/api/performers/:id/refresh", async (reque
 app.post<{ Params: { id: string } }>("/api/performers/:id/discover-sources", async (request) => {
   const performer = db.getPerformer(request.params.id);
   if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
+  beginPerformerOperation(performer.id);
+  try {
   const added = [];
   for (const entry of plugins.list().filter((item) => item.installed && item.enabled && item.manifest.capabilities.includes("source-discovery"))) {
     const plugin = plugins.get(entry.manifest.id);
@@ -476,6 +495,7 @@ app.post<{ Params: { id: string } }>("/api/performers/:id/discover-sources", asy
     for (const source of await plugin.discoverSources(plugins.context(entry.manifest.id), performer)) added.push(db.addSource(performer.id, entry.manifest.id, source));
   }
   return { sources: added };
+  } finally { performerOperations.delete(performer.id); }
 });
 app.post<{ Params: { id: string }; Body: unknown }>("/api/performers/:id/sources", async (request) => {
   const performer = db.getPerformer(request.params.id);
@@ -539,26 +559,9 @@ app.delete<{ Params: { id: string } }>("/api/sources/:id", async (request) => {
   return { deleted: true };
 });
 
-async function syncSource(sourceId: string) {
-  const source = db.getSource(sourceId);
-  if (!source) throw Object.assign(new Error("Source not found"), { statusCode: 404 });
-  if (!source.scraperPluginId) throw Object.assign(new Error("Select a scraper plugin for this URL first"), { statusCode: 409 });
-  const plugin = ensureScraperPlugin(source.scraperPluginId, source.profileUrl);
-  if (!plugin.listMedia) throw Object.assign(new Error("This source is informational; its plugin does not list media"), { statusCode: 409 });
-  try {
-    const candidates = await plugin.listMedia(plugins.context(source.scraperPluginId), source);
-    const storedDateChanges: string[] = [];
-    const result = db.ingestItems(source, candidates, (itemId) => storedDateChanges.push(itemId));
-    await queue.applyStoredMediaDates(storedDateChanges);
-    db.markSourceSynced(source.id, source.syncIntervalSeconds);
-    return { ...result, total: candidates.length };
-  } catch (error) {
-    db.markSourceSynced(source.id, source.syncIntervalSeconds, error instanceof Error ? error.message : String(error));
-    throw error;
-  }
-}
-
+const syncSource = (sourceId: string) => sourceSync.sync(sourceId);
 app.post<{ Params: { id: string } }>("/api/sources/:id/sync", async (request) => syncSource(request.params.id));
+app.post<{ Params: { id: string } }>("/api/sources/:id/hard-refresh", async (request) => sourceSync.sync(request.params.id, true));
 app.get<{ Querystring: Record<string, string | undefined> }>("/api/items", async (request) => {
   const query = z.object({
     page: z.coerce.number().int().min(1).default(1), pageSize: z.coerce.number().int().min(1).max(100).default(50),
@@ -595,7 +598,7 @@ const scheduledInFlight = new Set<string>();
 setInterval(() => {
   for (const source of db.dueSources()) {
     if (scheduledInFlight.size >= 4) break;
-    if (scheduledInFlight.has(source.id)) continue;
+    if (scheduledInFlight.has(source.id) || sourceSync.active.has(source.id)) continue;
     const owner = plugins.list().find((entry) => entry.manifest.id === source.scraperPluginId);
     if (!owner?.installed || !owner.enabled || !owner.manifest.capabilities.includes("media-listing")) continue;
     scheduledInFlight.add(source.id);

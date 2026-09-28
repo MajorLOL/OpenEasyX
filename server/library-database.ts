@@ -155,6 +155,10 @@ export class LibraryDatabase {
     this.sqlite.close();
   }
 
+  mergePerformerNames(previousName: string, nextName: string) {
+    this.sqlite.prepare("UPDATE media SET performer=? WHERE performer=? COLLATE NOCASE").run(nextName, previousName);
+  }
+
   upsertMedia(item: IndexedMedia) {
     this.sqlite.prepare(`
       INSERT INTO media(
