@@ -5,6 +5,7 @@ import { asJson, id, now } from "./utils.js";
 import type { MediaCandidate, PersonCandidate, SourceCandidate } from "../packages/plugin-sdk/index.js";
 import { firstMediaDate, oldestMediaDate, validMediaDate } from "../packages/media-date.js";
 import { outputDefaults } from "../packages/output-settings.js";
+import type { VideoFingerprint } from "./video-matching.js";
 
 export type Performer = {
   id: string; name: string; aliases: string[]; imageUrl?: string; externalRefs: Record<string, string>;
@@ -26,6 +27,7 @@ export type DownloadItem = {
   qualityScore: number; expectedBytes?: number; publishedAt?: string; metadata: Record<string, unknown>;
   status: string; progress: number; downloadedBytes: number; checksumSha256?: string; visualHash?: string; storagePath?: string; error?: string;
   downloadStartedAt?: string; downloadFinishedAt?: string;
+  duplicateOf?: string; duplicateReason?: string;
   createdAt: string; updatedAt: string;
 };
 
@@ -92,6 +94,10 @@ export class Database {
       CREATE INDEX IF NOT EXISTS items_status_idx ON items(status, updated_at);
       CREATE INDEX IF NOT EXISTS items_identity_idx ON items(identity_key, quality_score DESC);
       CREATE INDEX IF NOT EXISTS items_checksum_idx ON items(checksum_sha256);
+      CREATE TABLE IF NOT EXISTS video_fingerprints (
+        item_id TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+        file_stamp TEXT NOT NULL, fingerprint_json TEXT
+      );
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS live_cam_favorites (
         provider_id TEXT NOT NULL, username_key TEXT NOT NULL, cam_id TEXT NOT NULL, username TEXT NOT NULL,
@@ -116,6 +122,7 @@ export class Database {
     if (!itemColumns.has("download_started_at")) this.sqlite.exec("ALTER TABLE items ADD COLUMN download_started_at TEXT");
     if (!itemColumns.has("download_finished_at")) this.sqlite.exec("ALTER TABLE items ADD COLUMN download_finished_at TEXT");
     if (!itemColumns.has("downloaded_bytes")) this.sqlite.exec("ALTER TABLE items ADD COLUMN downloaded_bytes INTEGER NOT NULL DEFAULT 0");
+    if (!itemColumns.has("duplicate_reason")) this.sqlite.exec("ALTER TABLE items ADD COLUMN duplicate_reason TEXT");
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS items_visual_hash_idx ON items(performer_id,media_type,visual_hash)");
     this.sqlite.exec("CREATE INDEX IF NOT EXISTS items_storage_path_idx ON items(storage_path)");
     this.migrateNitterToPublicX();
@@ -479,12 +486,13 @@ export class Database {
 
   setItemStatus(itemId: string, status: string, values: { progress?: number; downloadedBytes?: number; error?: string | null; checksum?: string; storagePath?: string; duplicateOf?: string } = {}) {
     const stamp = now();
-    this.sqlite.prepare(`UPDATE items SET status=?,progress=COALESCE(?,progress),downloaded_bytes=CASE WHEN ?='queued' THEN 0 ELSE COALESCE(?,downloaded_bytes) END,error=?,checksum_sha256=COALESCE(?,checksum_sha256),storage_path=COALESCE(?,storage_path),duplicate_of=COALESCE(?,duplicate_of),
+    this.sqlite.prepare(`UPDATE items SET status=?,progress=COALESCE(?,progress),downloaded_bytes=CASE WHEN ?='queued' THEN 0 ELSE COALESCE(?,downloaded_bytes) END,error=?,checksum_sha256=COALESCE(?,checksum_sha256),storage_path=COALESCE(?,storage_path),duplicate_of=CASE WHEN ?='queued' THEN NULL ELSE COALESCE(?,duplicate_of) END,
+      duplicate_reason=CASE WHEN ?='duplicate' THEN duplicate_reason ELSE NULL END,
       published_at=CASE WHEN ?='downloading' AND json_extract(metadata_json,'$.live')=1 THEN COALESCE(download_started_at,?) ELSE published_at END,
       download_started_at=CASE WHEN ?='queued' THEN NULL WHEN ?='downloading' AND download_started_at IS NULL THEN ? ELSE download_started_at END,
       download_finished_at=CASE WHEN ? IN ('queued','downloading','paused','stopping','cancelling') THEN NULL WHEN ? IN ('completed','duplicate','failed','cancelled','deleted') THEN ? ELSE download_finished_at END,
       updated_at=? WHERE id=?`)
-      .run(status, values.progress ?? null, status, values.downloadedBytes ?? null, values.error ?? null, values.checksum ?? null, values.storagePath ?? null, values.duplicateOf ?? null,
+      .run(status, values.progress ?? null, status, values.downloadedBytes ?? null, values.error ?? null, values.checksum ?? null, values.storagePath ?? null, status, values.duplicateOf ?? null, status,
         status, stamp, status, status, stamp, status, status, stamp, stamp, itemId);
     return this.getItem(itemId);
   }
@@ -497,6 +505,32 @@ export class Database {
   findByIdentity(identityKey: string, exceptId: string, performerId: string): DownloadItem | undefined {
     const row = this.sqlite.prepare("SELECT * FROM items WHERE identity_key=? AND id<>? AND performer_id=? AND status='completed' ORDER BY quality_score DESC LIMIT 1").get(identityKey, exceptId, performerId) as any;
     return row ? this.mapItem(row) : undefined;
+  }
+
+  completedVideos(performerId: string, exceptId: string): DownloadItem[] {
+    return (this.sqlite.prepare("SELECT * FROM items WHERE performer_id=? AND id<>? AND media_type='video' AND status='completed' AND storage_path IS NOT NULL ORDER BY created_at DESC")
+      .all(performerId, exceptId) as any[]).map(this.mapItem);
+  }
+
+  getVideoFingerprint(itemId: string, fileStamp: string): VideoFingerprint | null | undefined {
+    const row = this.sqlite.prepare("SELECT fingerprint_json FROM video_fingerprints WHERE item_id=? AND file_stamp=?")
+      .get(itemId, fileStamp) as { fingerprint_json: string | null } | undefined;
+    if (!row) return undefined;
+    if (!row.fingerprint_json) return null;
+    const value = asJson<VideoFingerprint | null>(row.fingerprint_json, null);
+    return value?.version === 1 && Number.isFinite(value.duration) && Array.isArray(value.hashes)
+      && value.hashes.every((hash) => typeof hash === "string" && (hash === "" || /^[a-f0-9]{32}$/.test(hash))) ? value : undefined;
+  }
+
+  setVideoFingerprint(itemId: string, fileStamp: string, fingerprint: VideoFingerprint | undefined) {
+    this.sqlite.prepare(`INSERT INTO video_fingerprints(item_id,file_stamp,fingerprint_json) VALUES(?,?,?)
+      ON CONFLICT(item_id) DO UPDATE SET file_stamp=excluded.file_stamp,fingerprint_json=excluded.fingerprint_json`)
+      .run(itemId, fileStamp, fingerprint ? JSON.stringify(fingerprint) : null);
+  }
+
+  markVideoExcerpt(itemId: string, originalId: string, checksum: string) {
+    this.setItemStatus(itemId, "duplicate", { progress: 1, checksum, duplicateOf: originalId });
+    this.sqlite.prepare("UPDATE items SET duplicate_reason='contained-excerpt',storage_path=NULL WHERE id=?").run(itemId);
   }
 
   findVisualDuplicate(visualHash: string, exceptId: string, performerId: string, mediaType: string, maximumDistance = 5): DownloadItem | undefined {
@@ -543,6 +577,7 @@ export class Database {
       filename: row.filename ?? undefined, qualityScore: row.quality_score, expectedBytes: row.expected_bytes ?? undefined, publishedAt: row.published_at ?? undefined,
       metadata: asJson(row.metadata_json, {}), status: row.status, progress: row.progress, downloadedBytes: Number(row.downloaded_bytes ?? 0), checksumSha256: row.checksum_sha256 ?? undefined, visualHash: row.visual_hash ?? undefined,
       storagePath: row.storage_path ?? undefined, error: row.error ?? undefined,
+      duplicateOf: row.duplicate_of ?? undefined, duplicateReason: row.duplicate_reason ?? undefined,
       downloadStartedAt: row.download_started_at ?? undefined, downloadFinishedAt: row.download_finished_at ?? undefined,
       createdAt: row.created_at, updatedAt: row.updated_at };
   }

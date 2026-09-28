@@ -11,8 +11,9 @@ import type { LogWriter } from "./log-store.js";
 import { filenameFromUrl, safeSegment } from "./utils.js";
 import { downloadOutputPath, recordingEncodingArgs } from "./output-settings.js";
 import { outputSettings } from "../packages/output-settings.js";
+import { canMatchVideoExcerpt, fingerprintVideo, verifyVideoContainment, videoFileStamp, type VideoFingerprint } from "./video-matching.js";
 
-type ActiveDownload = { child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; action?: "stop" | "cancel" | "delete" };
+type ActiveDownload = { child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; matching?: boolean; action?: "stop" | "cancel" | "delete" };
 
 export class DownloadQueue {
   private active = new Map<string, ActiveDownload>();
@@ -45,6 +46,7 @@ export class DownloadQueue {
     const item = this.requiredItem(itemId);
     if (item.status === "queued") return this.db.setItemStatus(itemId, "paused");
     const control = this.active.get(itemId);
+    if (control?.matching) throw Object.assign(new Error("Video comparison is finishing; the download can still be cancelled"), { statusCode: 409 });
     if (item.status !== "downloading" || !control) throw Object.assign(new Error(`Cannot pause an item with status '${item.status}'`), { statusCode: 409 });
     control.paused = true; this.signal(control, "SIGSTOP");
     return this.db.setItemStatus(itemId, "paused");
@@ -89,7 +91,7 @@ export class DownloadQueue {
 
   private interrupt(itemId: string, action: ActiveDownload["action"]) {
     const item = this.requiredItem(itemId); const control = this.active.get(itemId);
-    if (action === "stop" && control?.encoding) return item;
+    if (action === "stop" && (control?.encoding || control?.matching)) return item;
     if (!control) {
       if (!["queued", "paused"].includes(item.status)) throw Object.assign(new Error(`Cannot ${action} an item with status '${item.status}'`), { statusCode: 409 });
       return this.db.setItemStatus(itemId, action === "delete" ? "deleted" : "cancelled");
@@ -174,7 +176,7 @@ export class DownloadQueue {
         reportProgress(contentLength ? received / contentLength : undefined, received, true);
         checksum = hash.digest("hex");
       }
-      if (control.action === "cancel" || control.action === "delete") throw new Error("Download cancelled");
+      if (["cancel", "delete"].includes(control.action ?? "")) throw new Error("Download cancelled");
       if (item.mediaType === "video" && item.metadata.live === true && settings.recordingPreset !== "source") {
         const encoded = path.join(temporaryDirectory, "encoded.mp4");
         control.action = undefined; control.encoding = true;
@@ -187,6 +189,19 @@ export class DownloadQueue {
         checksum = await this.hashFile(temporary);
       }
       await this.withFinalizeLock("output", async () => {
+        if (["cancel", "delete"].includes(control.action ?? "")) throw new Error("Download cancelled");
+        const comparison = item.mediaType === "video" ? await this.checkVideoExcerpt(item, temporary, control) : undefined;
+        if (["cancel", "delete"].includes(control.action ?? "")) throw new Error("Download cancelled");
+        if (comparison?.original) {
+          // An excerpt must never replace the full video, even at higher resolution,
+          // and its publication date must not alter the original's date.
+          fs.unlinkSync(temporary); temporary = "";
+          this.db.markVideoExcerpt(item.id, comparison.original.id, checksum);
+          this.writeLog?.("info", "download", "Excerpt already contained in a full video", {
+            itemId: item.id, duplicateOf: comparison.original.id, ...comparison.match,
+          });
+          return;
+        }
         const visual = await this.visualFingerprint(temporary, item.mediaType);
         const qualityScore = Math.max(item.qualityScore, visual?.qualityScore ?? 0);
         this.db.setDownloadFingerprint(item.id, visual?.hash, qualityScore);
@@ -211,6 +226,7 @@ export class DownloadQueue {
           if (oldPath && path.resolve(oldPath) !== path.resolve(finalPath) && fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
           const relativePath = path.relative(this.mediaRoot, finalPath);
           this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath: relativePath });
+          if (comparison) this.db.setVideoFingerprint(item.id, videoFileStamp(finalPath), comparison.fingerprint);
           this.writeLog?.("info", "download", "Higher-quality download stored", { itemId: item.id, replacedItemId: duplicate.id, storagePath: relativePath });
           this.db.supersedeDownload(duplicate.id, item.id);
           if (plugin.afterDownload) await plugin.afterDownload(this.plugins.context(item.pluginId), { absolutePath: finalPath, relativePath, mediaType: item.mediaType, checksumSha256: checksum });
@@ -223,6 +239,7 @@ export class DownloadQueue {
         fs.renameSync(temporary, finalPath); temporary = "";
         const relativePath = path.relative(this.mediaRoot, finalPath);
         this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath: relativePath });
+        if (comparison) this.db.setVideoFingerprint(item.id, videoFileStamp(finalPath), comparison.fingerprint);
         this.writeLog?.("info", "download", "Download completed", { itemId: item.id, storagePath: relativePath, mediaType: item.mediaType });
         if (plugin.afterDownload) await plugin.afterDownload(this.plugins.context(item.pluginId), { absolutePath: finalPath, relativePath, mediaType: item.mediaType, checksumSha256: checksum });
         void Promise.resolve(this.onCompleted?.()).catch((error) => this.writeLog?.("warn", "library", "Library refresh after download failed", { error }));
@@ -255,6 +272,49 @@ export class DownloadQueue {
   }
 
   private get downloadsRoot() { return path.join(this.mediaRoot, ".downloads"); }
+
+  private async checkVideoExcerpt(item: DownloadItem, file: string, control: ActiveDownload) {
+    const controller = new AbortController(); control.abort = controller; control.matching = true;
+    const timer = setTimeout(() => controller.abort(), 120_000); timer.unref();
+    let fingerprint: VideoFingerprint | undefined;
+    try {
+      this.writeLog?.("info", "download", "Checking video for an already stored full version", { itemId: item.id });
+      fingerprint = await fingerprintVideo(file, controller.signal);
+      if (!fingerprint || !canMatchVideoExcerpt(fingerprint)) return { fingerprint };
+      for (const original of this.db.completedVideos(item.performerId, item.id)) {
+        controller.signal.throwIfAborted();
+        const root = path.resolve(this.mediaRoot);
+        const originalFile = path.resolve(root, original.storagePath!);
+        if (!originalFile.startsWith(`${root}${path.sep}`)) continue;
+        try {
+          const stamp = videoFileStamp(originalFile);
+          let full = this.db.getVideoFingerprint(original.id, stamp);
+          if (full === undefined) {
+            full = await fingerprintVideo(originalFile, controller.signal) ?? null;
+            if (videoFileStamp(originalFile) !== stamp) continue;
+            this.db.setVideoFingerprint(original.id, stamp, full ?? undefined);
+          }
+          if (!full) continue;
+          const match = await verifyVideoContainment(file, fingerprint, originalFile, full, controller.signal);
+          if (match && videoFileStamp(originalFile) === stamp && this.db.getItem(original.id)?.status === "completed") {
+            return { fingerprint, original, match };
+          }
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
+          // Missing files, unsupported codecs or stale cache entries cannot
+          // justify discarding the new video.
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      return { fingerprint };
+    } catch (error) {
+      this.writeLog?.("warn", "download", "Video comparison unavailable; keeping the downloaded video", { itemId: item.id, error: error instanceof Error ? error.message : String(error) });
+      return fingerprint ? { fingerprint } : undefined;
+    } finally {
+      clearTimeout(timer); control.matching = false;
+      if (control.abort === controller) control.abort = undefined;
+    }
+  }
 
   private prepareOutputDirectory(directory: string) {
     const root = path.resolve(this.mediaRoot); const relative = path.relative(root, directory);
