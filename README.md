@@ -104,6 +104,12 @@ Important environment variables include `PUID`, `PGID`, `EASYX_SCAN_INTERVAL_MIN
 
 Every push to `main` runs tests, TypeScript, the production web build, a Docker build, and runtime checks. A successful push automatically creates a `YEAR.WEEK.N` version (for example `2026.35.1`), publishes the multi-architecture image to `ghcr.io/raccommode/open-easyx` with both that version and `latest`, injects the version into the application, and creates the matching GitHub Release. Pull requests run the same checks without publishing a release.
 
+AMD64 and ARM64 images build concurrently on native GitHub runners, with a separate persistent cache for each architecture. Each image passes the Unraid-style runtime and browser checks before upload; version and `latest` tags are published only after both images and the application tests succeed. Release metadata is added after dependency installation so a new version does not reinstall Chromium, Python tools, or subtitle libraries. The first build, dependency changes, or an expired cache still take longer than a routine code update.
+
+For a manual validation or cache benchmark without publishing, run the workflow with **Publish image tags and create a release** disabled.
+
+Run the same container checks locally with `bash scripts/docker-runtime-smoke.sh <image> <expected-version>`.
+
 ## Responsible use
 
 Only download, retain, and view material you are legally authorized to access. Third-party plugins execute trusted server-side code; review their source before installation.

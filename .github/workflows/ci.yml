@@ -6,10 +6,19 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      publish:
+        description: Publish image tags and create a release
+        type: boolean
+        default: true
       platforms:
         description: Docker platforms to publish
         required: true
+        type: choice
         default: linux/amd64,linux/arm64
+        options:
+          - linux/amd64,linux/arm64
+          - linux/amd64
+          - linux/arm64
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -18,9 +27,50 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  IMAGE: ghcr.io/raccommode/open-easyx
+
 jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.platforms.outputs.matrix }}
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+    steps:
+      - name: Select native runners
+        id: platforms
+        env:
+          PLATFORMS: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          runners = {"linux/amd64": "ubuntu-24.04", "linux/arm64": "ubuntu-24.04-arm"}
+          platforms = list(dict.fromkeys(os.environ["PLATFORMS"].split(",")))
+          matrix = {"include": [{"platform": p, "arch": p.split("/")[1], "runner": runners[p]} for p in platforms]}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print("matrix=" + json.dumps(matrix), file=output)
+          PY
+      - name: Compute version (YEAR.WEEK.N)
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+        run: |
+          if [ "$PUBLISH" != true ]; then
+            echo "version=ci-test" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PREFIX=$(date -u +%G.%V)
+          LATEST=$(gh release list --limit 100 --json tagName -q \
+            "[.[] | select(.tagName | startswith(\"${PREFIX}.\"))] | length")
+          VERSION="${PREFIX}.$((LATEST + 1))"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Computed version: $VERSION"
+
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -28,120 +78,122 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: Install recording test codecs
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install recording test codecs if absent
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
       - run: npm run check
         env:
           NODE_OPTIONS: --no-experimental-webstorage
       - run: python -m py_compile worker/subtitles.py
-      - run: docker build --build-arg APP_VERSION=ci-test -t open-easyx:ci .
+
+  image:
+    name: Image (${{ matrix.arch }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and load the release image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: open-easyx:ci
+          build-args: APP_VERSION=${{ needs.prepare.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,scope=image-${{ matrix.arch }},mode=max
       - name: Test Docker runtime with an Unraid-style volume
-        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash scripts/docker-runtime-smoke.sh open-easyx:ci "$VERSION"
+      - name: Log in to GHCR
+        if: needs.prepare.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Reuse the builder's exact cached result after the runtime test. Upload by
+      # digest only: version/latest tags are gated on all tests and platforms.
+      - name: Upload tested image by digest
+        if: needs.prepare.outputs.publish == 'true'
+        id: upload
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: APP_VERSION=${{ needs.prepare.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+      - name: Export image digest
+        if: needs.prepare.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.upload.outputs.digest }}
         run: |
-          volume="open-easyx-ci-data-${GITHUB_RUN_ID}"
-          container="open-easyx-ci-${GITHUB_RUN_ID}"
-          cleanup() {
-            docker rm -f "$container" >/dev/null 2>&1 || true
-            docker volume rm "$volume" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
-
-          docker volume create "$volume"
-          docker run -d --name "$container" -e PUID=99 -e PGID=100 -v "$volume:/data" open-easyx:ci
-
-          for attempt in {1..20}; do
-            if docker exec "$container" node -e "fetch('http://127.0.0.1:3210/api/health').then(r => { if (!r.ok) process.exit(1) })" 2>/dev/null; then
-              break
-            fi
-            if [ "$attempt" = 20 ]; then
-              docker logs "$container"
-              exit 1
-            fi
-            sleep 1
-          done
-
-          docker exec "$container" sh -lc 'test "$(awk "/^Uid:/ { print \$2 }" /proc/1/status)" = 99 && test "$(cat /proc/1/comm)" = tini'
-          docker exec "$container" sh -lc 'test -w /data && test -f /data/easyx.sqlite && test -f /data/open-easyx-library.sqlite'
-          docker exec "$container" node -e "fetch('http://127.0.0.1:3210/api/health').then(r=>r.json()).then(v=>{if(v.product!=='Open EasyX'||!v.ok||v.version!=='ci-test')throw Error(JSON.stringify(v))})"
-          docker exec "$container" node -e "fetch('http://127.0.0.1:3210/api/version').then(r=>r.json()).then(v=>{if(v.version!=='ci-test')throw Error(JSON.stringify(v))})"
-          docker exec "$container" node -e "fetch('http://127.0.0.1:3210/api/plugin-repositories').then(r=>r.json()).then(v=>{if(!Array.isArray(v)||!v.find(x=>x.id==='official'&&!x.removable))throw Error(JSON.stringify(v))})"
-          docker exec "$container" node -e "fetch('http://127.0.0.1:3210/api/plugins/org.easyx.manyvids/browser-login/start',{method:'POST'}).then(async r=>{const v=await r.json();if(!r.ok||!v.active||!v.viewerPath)throw Error(JSON.stringify(v))})"
-          docker exec "$container" node -e "fetch('http://127.0.0.1:3210/browser/vnc.html').then(r=>{if(!r.ok)throw Error('noVNC '+r.status)})"
-          docker cp scripts/browser-paste-smoke.mjs "$container:/tmp/browser-paste-smoke.mjs"
-          docker exec "$container" node /tmp/browser-paste-smoke.mjs
-          docker exec "$container" node -e "fetch('http://127.0.0.1:3210/api/plugins/org.easyx.manyvids/browser-login',{method:'DELETE'}).then(r=>{if(!r.ok)throw Error('stop '+r.status)})"
-          sleep 1
-          docker exec "$container" sh -lc 'if ps -eo stat | grep -q "^Z"; then exit 1; fi'
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        if: needs.prepare.outputs.publish == 'true'
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
   publish:
-    needs: test
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_name == 'main')
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    needs: [prepare, test, image]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       packages: write
-
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
         with:
-          fetch-depth: 1
-
-      - name: Compute version (YEAR.WEEK.N)
-        id: version
-        run: |
-          YEAR=$(date -u +%G)
-          WEEK=$(date -u +%V)
-          # Remove leading zero for clean version number
-          WEEK_NUM=$((10#$WEEK))
-          WEEK_PAD=$(printf "%02d" "$WEEK_NUM")
-
-          # Find existing releases for this year.week prefix
-          PREFIX="${YEAR}.${WEEK_PAD}"
-          LATEST=$(gh release list --limit 100 --json tagName -q \
-            "[.[] | select(.tagName | startswith(\"${PREFIX}.\"))] | length")
-
-          N=$(( LATEST + 1 ))
-          VERSION="${PREFIX}.${N}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Computed version: $VERSION"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/setup-qemu-action@v3
-
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
       - uses: docker/setup-buildx-action@v3
-
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/raccommode/open-easyx
-          tags: |
-            type=raw,value=${{ steps.version.outputs.version }}
-            type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          platforms: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms || 'linux/amd64,linux/arm64' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            APP_VERSION=${{ steps.version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
+      - name: Publish multi-platform tags without rebuilding
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          images=()
+          for digest in "$RUNNER_TEMP"/digests/*; do
+            hash=$(basename "$digest")
+            [[ "$hash" =~ ^[a-f0-9]{64}$ ]]
+            images+=("$IMAGE@sha256:$hash")
+          done
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" --tag "$IMAGE:latest" "${images[@]}"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
       - name: Create GitHub Release
-        if: github.ref_name == 'main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: v${{ steps.version.outputs.version }}
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: v${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
