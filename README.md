@@ -78,6 +78,10 @@ npm run check
 
 ## Plugins and stores
 
+**ViralXXXPorn** supports public model video collections (`/models/<name>/`), search results (`/search/<query>/`), video lists, and individual `/video/<id>/...` and `/short/<id>/...` pages. Collection scans follow pagination up to **Maximum videos per scan** (100 by default). Downloads refresh the page's public MP4 link and select its highest available resolution. Photo albums and account-restricted videos are not supported.
+
+**DirtyShip** supports performer video collections (`/performer/<name>/`), individual video pages, and full-resolution photo galleries (`/gallery/<name>/`). Both plugins are available in the built-in store; install the plugin, assign it to a performer's source URL, then select **Scrape now**.
+
 Plugins are grouped in the UI by what they add:
 
 - **Sources & discovery** — identity search, source discovery, scraping, and download resolution;
