@@ -26,17 +26,18 @@ export class SourceSync {
       if (!current || current.profileUrl !== source.profileUrl || current.scraperPluginId !== source.scraperPluginId) {
         throw Object.assign(new Error("Source changed during the scan; run it again"), { statusCode: 409 });
       }
+      const scanCandidates = this.db.liveScanCandidates(current, candidates);
       const dates: string[] = [];
       const result = hardRefresh
-        ? this.db.hardRefreshItems(current, candidates, (item) => {
+        ? this.db.hardRefreshItems(current, scanCandidates, (item) => {
           if (!item.storagePath) return false;
           try { const stat = fs.statSync(path.join(this.mediaRoot, item.storagePath)); return stat.isFile() && stat.size > 0; }
           catch (error) { if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return false; throw error; }
         }, (id) => dates.push(id))
-        : this.db.ingestItems(current, candidates, (id) => dates.push(id));
+        : this.db.ingestItems(current, scanCandidates, (id) => dates.push(id));
       await this.applyDates(dates);
       this.db.markSourceSynced(source.id, current.syncIntervalSeconds);
-      return { ...result, total: candidates.length };
+      return { ...result, skipped: result.skipped + candidates.length - scanCandidates.length, total: candidates.length };
     } catch (error) {
       this.db.markSourceSynced(source.id, source.syncIntervalSeconds, error instanceof Error ? error.message : String(error));
       throw error;

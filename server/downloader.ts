@@ -1,3 +1,4 @@
+import { concurrentDownloads } from "./download-limits.js";
 import { validMediaDate } from "../packages/media-date.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -94,15 +95,17 @@ export class DownloadQueue {
     if (action === "stop" && (control?.encoding || control?.matching)) return item;
     if (!control) {
       if (!["queued", "paused"].includes(item.status)) throw Object.assign(new Error(`Cannot ${action} an item with status '${item.status}'`), { statusCode: 409 });
+      this.db.suppressLiveRecording(itemId);
       return this.db.setItemStatus(itemId, action === "delete" ? "deleted" : "cancelled");
     }
+    this.db.suppressLiveRecording(itemId);
     control.action = action; control.paused = false;
     this.signal(control, "SIGCONT"); this.signal(control, action === "stop" ? "SIGINT" : "SIGTERM"); control.abort?.abort();
     return this.db.setItemStatus(itemId, action === "stop" ? "stopping" : "cancelling");
   }
 
   private async tick() {
-    const max = Math.max(1, Math.min(8, Number(this.db.getSettings().maxConcurrentDownloads ?? 2)));
+    const max = concurrentDownloads(this.db.getSettings().maxConcurrentDownloads);
     while (this.active.size < max) {
       const item = this.db.nextQueued();
       if (!item || this.active.has(item.id)) return;
@@ -133,11 +136,13 @@ export class DownloadQueue {
       const performer = this.db.getPerformer(item.performerId); const source = this.db.getSource(item.sourceId);
       if (!performer || !source) throw new Error("The performer or source no longer exists");
       const settings = outputSettings(this.db.getSettings());
-      const request = await plugin.resolveDownload(this.plugins.context(item.pluginId), {
+      const resolutionController = new AbortController(); control.abort = resolutionController;
+      const request = await plugin.resolveDownload(this.plugins.context(item.pluginId, resolutionController.signal), {
         externalId: item.externalId, identityKey: item.identityKey, title: item.title, pageUrl: item.pageUrl,
         mediaType: item.mediaType as any, filename: item.filename, qualityScore: item.qualityScore,
         expectedBytes: item.expectedBytes, publishedAt: item.publishedAt, metadata: item.metadata,
       });
+      resolutionController.signal.throwIfAborted();
       const fallback = `${item.externalId}.${item.mediaType === "image" ? "jpg" : item.mediaType === "video" ? "mp4" : "bin"}`;
       const requestUrl = request.kind === "command" ? item.pageUrl ?? item.externalId : request.url;
       const filename = safeSegment(request.filename ?? item.filename ?? filenameFromUrl(requestUrl, fallback), fallback);
@@ -157,7 +162,7 @@ export class DownloadQueue {
         await this.runCommandDownload(request.command, request.args.map((argument) => {
           for (const [placeholder, value] of Object.entries(placeholders)) argument = argument.replaceAll(placeholder, value);
           return argument;
-        }), temporaryDirectory, item.expectedBytes, reportProgress, control);
+        }), temporaryDirectory, item.expectedBytes, reportProgress, control, request.requireSuccessfulExit);
         if (!fs.existsSync(temporary) || fs.statSync(temporary).size === 0) throw new Error("Extractor completed without producing a media file");
         reportProgress(0.99, fs.statSync(temporary).size, true);
         checksum = await this.hashFile(temporary);
@@ -246,6 +251,12 @@ export class DownloadQueue {
       });
     } catch (error) {
       let message = error instanceof Error ? error.message : String(error);
+      const parts = temporaryDirectory && path.join(temporaryDirectory, "live-parts");
+      if (!["cancel", "delete"].includes(control.action ?? "") && parts && fs.existsSync(parts) && fs.readdirSync(parts).some((file) => file.endsWith(".ts") && fs.statSync(path.join(parts, file)).size > 0)) {
+        preserveTemporary = true;
+        if (control.action === "stop") control.action = undefined;
+        message += ` Recording parts preserved at ${temporaryDirectory}; recover them before retrying.`;
+      }
       if (control.encoding && !control.action && temporary && fs.existsSync(temporary)) {
         try {
           const recoveryDirectory = path.join(this.mediaRoot, ".recording-recovery", safeSegment(item.id));
@@ -346,7 +357,7 @@ export class DownloadQueue {
     child.kill(signal);
   }
 
-  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload): Promise<void> {
+  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, requireSuccessfulExit = false): Promise<void> {
     return new Promise((resolve, reject) => {
       const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
       control.child = child;
@@ -371,7 +382,7 @@ export class DownloadQueue {
       child.once("error", (error) => finish(error));
       child.once("close", (code) => {
         control.child = undefined;
-        if (code === 0 || (control.action === "stop" && this.directoryBytes(outputDirectory) > 0)) finish();
+        if (code === 0 || (!requireSuccessfulExit && control.action === "stop" && this.directoryBytes(outputDirectory) > 0)) finish();
         else finish(new Error(`${command} exited with code ${code}: ${output.trim() || "no error output"}`));
       });
     });
