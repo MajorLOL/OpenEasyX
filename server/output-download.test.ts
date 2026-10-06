@@ -39,6 +39,23 @@ async function complete(db: Database, id: string) {
 }
 
 describe("custom download output", () => {
+  it("preserves captured parts when finalization fails after a manual stop", async () => {
+    const { root, db, plugins, source, queue, add } = await fixture();
+    const script = "const fs=require('node:fs'),path=require('node:path'),output=process.argv[1],parts=path.join(path.dirname(output),'live-parts');fs.mkdirSync(parts);fs.writeFileSync(path.join(parts,'part-001.ts'),'captured');process.on('SIGINT',()=>{fs.writeFileSync(output,'broken');process.exit(1)});setInterval(()=>{},1000)";
+    plugins.get("test.output").resolveDownload = async () => ({ kind: "command", command: process.execPath, args: ["-e", script, "{output}"], filename: "original.mp4", requireSuccessfulExit: true });
+    const item = add("failed-finalize", true); queue.start();
+    const part = path.join(root, "media", ".downloads", item.id, "live-parts", "part-001.ts");
+    const deadline = Date.now() + 4000;
+    while (!fs.existsSync(part)) { if (Date.now() > deadline) throw new Error("Recorder did not start"); await new Promise((resolve) => setTimeout(resolve, 20)); }
+    queue.stopRecording(item.id);
+    while (db.getItem(item.id)?.status !== "failed") { if (Date.now() > deadline) throw new Error(JSON.stringify(db.getItem(item.id))); await new Promise((resolve) => setTimeout(resolve, 20)); }
+    queue.stop();
+    expect(fs.readFileSync(part, "utf8")).toBe("captured");
+    expect(db.getItem(item.id)?.error).toContain("Recording parts preserved");
+    expect(db.getItem(item.id)?.storagePath).toBeUndefined();
+    expect(db.liveScanCandidates(source, [{ externalId: item.externalId, mediaType: "video", metadata: { live: true } }])).toEqual([]);
+  });
+
   it("writes directly into a model folder and keeps the library's source metadata", async () => {
     const { root, db, source, media, queue, add } = await fixture({ outputPathTemplate: "{performer}", outputFilenameTemplate: "{site}-{filename}" });
     const item = add("one"); expect(queue.outputPath(item.id)).toBe("Alice/example.test-original.mp4");

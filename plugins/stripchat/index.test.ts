@@ -97,7 +97,7 @@ describe("Stripchat direct live playback", () => {
     await expect(resolveStripchatDownload(mock, {
       externalId: "stripchat:alice:session", pageUrl: "https://stripchat.com/Alice", mediaType: "video", filename: "alice.mp4",
     })).resolves.toEqual({
-      kind: "command", command: process.execPath, filename: "alice.mp4",
+      kind: "command", command: process.execPath, requireSuccessfulExit: true, filename: "alice.mp4",
       args: expect.arrayContaining([
         "-e", "https://media-hls.doppiocdn.media/live/42.m3u8?pkey=PublicKey123456", "{output}",
       ]),

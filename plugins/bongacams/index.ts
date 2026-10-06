@@ -170,7 +170,7 @@ export async function resolveBongacamsDownload(context: PluginContext, item: Med
       const mediaUrl = await bongacamsLiveVariant(context, room.masterUrl);
       if (mediaUrl) {
         return {
-          kind: "command", command: process.execPath, filename: item.filename ?? "bongacams-live.mp4",
+          kind: "command", command: process.execPath, requireSuccessfulExit: true, filename: item.filename ?? "bongacams-live.mp4",
           args: ["-e", LIVE_RECORDER_SCRIPT, mediaUrl, room.masterUrl, JSON.stringify(streamHeaders()), "{output}", String(MERGE_GAP_MS), String(MERGE_POLL_MS), USER_AGENT],
         };
       }

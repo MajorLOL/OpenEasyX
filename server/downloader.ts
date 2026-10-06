@@ -162,7 +162,7 @@ export class DownloadQueue {
         await this.runCommandDownload(request.command, request.args.map((argument) => {
           for (const [placeholder, value] of Object.entries(placeholders)) argument = argument.replaceAll(placeholder, value);
           return argument;
-        }), temporaryDirectory, item.expectedBytes, reportProgress, control);
+        }), temporaryDirectory, item.expectedBytes, reportProgress, control, request.requireSuccessfulExit);
         if (!fs.existsSync(temporary) || fs.statSync(temporary).size === 0) throw new Error("Extractor completed without producing a media file");
         reportProgress(0.99, fs.statSync(temporary).size, true);
         checksum = await this.hashFile(temporary);
@@ -252,8 +252,9 @@ export class DownloadQueue {
     } catch (error) {
       let message = error instanceof Error ? error.message : String(error);
       const parts = temporaryDirectory && path.join(temporaryDirectory, "live-parts");
-      if (!control.action && parts && fs.existsSync(parts) && fs.readdirSync(parts).some((file) => file.endsWith(".ts") && fs.statSync(path.join(parts, file)).size > 0)) {
+      if (!["cancel", "delete"].includes(control.action ?? "") && parts && fs.existsSync(parts) && fs.readdirSync(parts).some((file) => file.endsWith(".ts") && fs.statSync(path.join(parts, file)).size > 0)) {
         preserveTemporary = true;
+        if (control.action === "stop") control.action = undefined;
         message += ` Recording parts preserved at ${temporaryDirectory}; recover them before retrying.`;
       }
       if (control.encoding && !control.action && temporary && fs.existsSync(temporary)) {
@@ -356,7 +357,7 @@ export class DownloadQueue {
     child.kill(signal);
   }
 
-  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload): Promise<void> {
+  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, requireSuccessfulExit = false): Promise<void> {
     return new Promise((resolve, reject) => {
       const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
       control.child = child;
@@ -381,7 +382,7 @@ export class DownloadQueue {
       child.once("error", (error) => finish(error));
       child.once("close", (code) => {
         control.child = undefined;
-        if (code === 0 || (control.action === "stop" && this.directoryBytes(outputDirectory) > 0)) finish();
+        if (code === 0 || (!requireSuccessfulExit && control.action === "stop" && this.directoryBytes(outputDirectory) > 0)) finish();
         else finish(new Error(`${command} exited with code ${code}: ${output.trim() || "no error output"}`));
       });
     });

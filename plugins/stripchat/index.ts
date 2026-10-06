@@ -312,7 +312,7 @@ export async function resolveStripchatDownload(context: PluginContext, item: Med
   if (!item.pageUrl) throw new Error("Stripchat recording is missing its public room URL");
   const stream = await resolveStripchatHlsWithRetry(context, item.pageUrl);
   return {
-    kind: "command", command: process.execPath, filename: item.filename ?? "stripchat-live.mp4",
+    kind: "command", command: process.execPath, requireSuccessfulExit: true, filename: item.filename ?? "stripchat-live.mp4",
     args: [
       "-e", LIVE_RECORDER_SCRIPT, stream.mediaUrl, stream.masterUrl, JSON.stringify(stream.headers), "{output}",
       String(STRIPCHAT_MERGE_GAP_MS), String(STRIPCHAT_MERGE_POLL_MS), USER_AGENT,
