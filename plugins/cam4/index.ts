@@ -225,22 +225,56 @@ async function cam4Json(context: PluginContext, url: string, username: string): 
 
 type Cam4Profile = { username: string; imageUrl?: string; online?: boolean; gender?: string; country?: string };
 
-/** Exact username lookup via the CAM4 profile API. Undefined when there is no such performer. */
-export async function cam4ProfileByUsername(context: PluginContext, username: string): Promise<Cam4Profile | undefined> {
-  const { status, data } = await cam4Json(context, `https://www.cam4.com/rest/v1.0/profile/${encodeURIComponent(username)}/info`, username);
-  if (status === 404 || status === 400 || status === 410 || status === 204) return undefined;
-  if (status === 403) throw new Error(`CAM4 refused the profile lookup for ${username} (HTTP 403)`);
-  if (!data) throw new Error(`CAM4 profile lookup for ${username} returned HTTP ${status}`);
+function profileFromInfo(data: Record<string, unknown>, username: string): Cam4Profile | undefined {
   const found = findString(data, new Set(["username", "screenname", "login"]));
   if (found && found.toLowerCase() !== username.toLowerCase()) return undefined;
   const imageUrl = findString(data, new Set(["profileimagelink", "profileimageurl", "profilepictureurl", "avatarurl", "avatar", "photourl"]));
+  const gender = findString(data, new Set(["gender", "sex"]));
+  const country = findString(data, new Set(["country", "countrycode"]));
   return {
     username: found ?? username,
     ...(imageUrl && /^https?:\/\//i.test(imageUrl) ? { imageUrl } : {}),
     ...(typeof data.online === "boolean" ? { online: data.online } : {}),
-    ...(findString(data, new Set(["gender", "sex"])) ? { gender: findString(data, new Set(["gender", "sex"])) } : {}),
-    ...(findString(data, new Set(["country", "countrycode"])) ? { country: findString(data, new Set(["country", "countrycode"])) } : {}),
+    ...(gender ? { gender } : {}), ...(country ? { country } : {}),
   };
+}
+
+/** The username as written in the profile page data, when the page describes that performer. */
+export function cam4UsernameInPage(html: string, username: string): string | undefined {
+  const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`"(?:username|screenName|nickname)"\\s*:\\s*"(${escaped})"`, "i").exec(html);
+  return match?.[1];
+}
+
+/**
+ * Exact username lookup. Undefined when there is no such performer.
+ *
+ * CAM4's profile info API now answers HTTP 401 without a login on www.cam4.com, so
+ * this tries, in order: the info API on hu.cam4.com (used by other recorders), the
+ * public stream API (confirms rooms that are live), and the public profile page.
+ */
+export async function cam4ProfileByUsername(context: PluginContext, username: string): Promise<Cam4Profile | undefined> {
+  const problems: string[] = [];
+  for (const host of ["hu.cam4.com", "www.cam4.com"]) {
+    const { status, data } = await cam4Json(context, `https://${host}/rest/v1.0/profile/${encodeURIComponent(username)}/info`, username);
+    if (data && status >= 200 && status < 300) return profileFromInfo(data, username);
+    if (status === 404 || status === 410) return undefined;
+    problems.push(`info on ${host}: HTTP ${status}`);
+  }
+  const stream = await cam4Json(context, `https://www.cam4.com/rest/v1.0/profile/${encodeURIComponent(username)}/streamInfo`, username);
+  if (stream.data && typeof stream.data.cdnURL === "string") return { username, online: true };
+  if (stream.status !== 204 && !(stream.status >= 200 && stream.status < 300)) problems.push(`streamInfo: HTTP ${stream.status}`);
+  try {
+    const html = await browserHtml(context, `https://www.cam4.com/${encodeURIComponent(username)}`);
+    const found = cam4UsernameInPage(html, username);
+    if (found) return { username: found, ...(stream.status === 204 ? { online: false } : {}) };
+    return undefined;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/HTTP 404/.test(message)) return undefined;
+    problems.push(`profile page: ${message}`);
+  }
+  throw new Error(`CAM4 profile lookup for ${username} failed (${problems.join("; ")})`);
 }
 
 export async function searchCam4People(context: PluginContext, query: string): Promise<PersonCandidate[]> {
