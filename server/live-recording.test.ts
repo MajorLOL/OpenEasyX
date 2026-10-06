@@ -37,6 +37,11 @@ describe("live scan recording lifecycle", () => {
     const next = items.find((item) => item.id !== first.id)!;
     expect(next.status).toBe("queued"); expect(next.externalId).not.toBe(first.externalId); expect(next.filename).not.toBe(first.filename);
     await sync.sync(f.source.id); expect(f.db.listItems()).toHaveLength(2);
+    f.db.setItemStatus(next.id, "downloading");
+    await sync.sync(f.source.id, true);
+    expect(f.db.getItem(first.id)?.status).toBe("completed");
+    expect(f.db.getItem(next.id)?.status).toBe("downloading");
+    expect(f.db.listItems()).toHaveLength(2);
   });
   it.each(["completed", "cancelled", "deleted"])("keeps a manual %s suppressed across restart until an offline scan", async (status) => {
     const f = fixture(); await f.scanner().sync(f.source.id); const first = f.db.listItems()[0];
