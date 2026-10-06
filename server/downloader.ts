@@ -1,3 +1,4 @@
+import { concurrentDownloads } from "./download-limits.js";
 import { validMediaDate } from "../packages/media-date.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -94,15 +95,17 @@ export class DownloadQueue {
     if (action === "stop" && (control?.encoding || control?.matching)) return item;
     if (!control) {
       if (!["queued", "paused"].includes(item.status)) throw Object.assign(new Error(`Cannot ${action} an item with status '${item.status}'`), { statusCode: 409 });
+      this.db.suppressLiveRecording(itemId);
       return this.db.setItemStatus(itemId, action === "delete" ? "deleted" : "cancelled");
     }
+    this.db.suppressLiveRecording(itemId);
     control.action = action; control.paused = false;
     this.signal(control, "SIGCONT"); this.signal(control, action === "stop" ? "SIGINT" : "SIGTERM"); control.abort?.abort();
     return this.db.setItemStatus(itemId, action === "stop" ? "stopping" : "cancelling");
   }
 
   private async tick() {
-    const max = Math.max(1, Math.min(8, Number(this.db.getSettings().maxConcurrentDownloads ?? 2)));
+    const max = concurrentDownloads(this.db.getSettings().maxConcurrentDownloads);
     while (this.active.size < max) {
       const item = this.db.nextQueued();
       if (!item || this.active.has(item.id)) return;
@@ -133,11 +136,13 @@ export class DownloadQueue {
       const performer = this.db.getPerformer(item.performerId); const source = this.db.getSource(item.sourceId);
       if (!performer || !source) throw new Error("The performer or source no longer exists");
       const settings = outputSettings(this.db.getSettings());
-      const request = await plugin.resolveDownload(this.plugins.context(item.pluginId), {
+      const resolutionController = new AbortController(); control.abort = resolutionController;
+      const request = await plugin.resolveDownload(this.plugins.context(item.pluginId, resolutionController.signal), {
         externalId: item.externalId, identityKey: item.identityKey, title: item.title, pageUrl: item.pageUrl,
         mediaType: item.mediaType as any, filename: item.filename, qualityScore: item.qualityScore,
         expectedBytes: item.expectedBytes, publishedAt: item.publishedAt, metadata: item.metadata,
       });
+      resolutionController.signal.throwIfAborted();
       const fallback = `${item.externalId}.${item.mediaType === "image" ? "jpg" : item.mediaType === "video" ? "mp4" : "bin"}`;
       const requestUrl = request.kind === "command" ? item.pageUrl ?? item.externalId : request.url;
       const filename = safeSegment(request.filename ?? item.filename ?? filenameFromUrl(requestUrl, fallback), fallback);
@@ -246,6 +251,11 @@ export class DownloadQueue {
       });
     } catch (error) {
       let message = error instanceof Error ? error.message : String(error);
+      const parts = temporaryDirectory && path.join(temporaryDirectory, "live-parts");
+      if (!control.action && parts && fs.existsSync(parts) && fs.readdirSync(parts).some((file) => file.endsWith(".ts") && fs.statSync(path.join(parts, file)).size > 0)) {
+        preserveTemporary = true;
+        message += ` Recording parts preserved at ${temporaryDirectory}; recover them before retrying.`;
+      }
       if (control.encoding && !control.action && temporary && fs.existsSync(temporary)) {
         try {
           const recoveryDirectory = path.join(this.mediaRoot, ".recording-recovery", safeSegment(item.id));

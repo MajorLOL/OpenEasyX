@@ -1,3 +1,4 @@
+import { maxConcurrentDownloadsLimit } from "./download-limits.js";
 import path from "node:path";
 import fs from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -587,7 +588,7 @@ app.post<{ Params: { id: string } }>("/api/items/:id/stop", async (request) => q
 app.post<{ Params: { id: string } }>("/api/items/:id/cancel", async (request) => queue.cancel(request.params.id));
 app.delete<{ Params: { id: string } }>("/api/items/:id", async (request) => queue.delete(request.params.id));
 
-app.get("/api/settings", async () => ({ ...db.getSettings(), mediaRoot: mediaDir, ...library.settings() }));
+app.get("/api/settings", async () => ({ ...db.getSettings(), mediaRoot: mediaDir, ...library.settings(), maxConcurrentDownloadsLimit }));
 app.put<{ Body: Record<string, unknown> }>("/api/settings", async (request) => {
   const parsed = settingsSchema.safeParse(request.body);
   if (!parsed.success) throw Object.assign(new Error(parsed.error.issues.map((issue) => issue.message).join(" ")), { statusCode: 400 });

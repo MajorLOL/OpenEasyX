@@ -1,3 +1,4 @@
+import { maxConcurrentDownloadsLimit } from "./download-limits.js";
 import { firstMediaDate } from "../packages/media-date.js";
 import path from "node:path";
 import { z } from "zod";
@@ -8,7 +9,7 @@ const template = (kind: "path" | "filename") => z.string().superRefine((value, c
   const message = validateOutputTemplate(value, kind); if (message) context.addIssue({ code: "custom", message });
 });
 export const settingsSchema = z.object({
-  retentionDays: z.number().int().min(0).max(36500).optional(), maxConcurrentDownloads: z.number().int().min(1).max(8).optional(),
+  retentionDays: z.number().int().min(0).max(36500).optional(), maxConcurrentDownloads: z.number().int().min(1).max(maxConcurrentDownloadsLimit).optional(),
   autoQueueDiscovered: z.boolean().optional(), legalAccepted: z.boolean().optional(),
   defaultScrapeIntervalMinutes: z.number().int().min(5).max(525600).optional(), defaultLiveIntervalSeconds: z.number().int().min(5).max(3600).optional(),
   outputPathTemplate: template("path").optional(), outputFilenameTemplate: template("filename").optional(),

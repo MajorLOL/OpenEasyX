@@ -109,6 +109,12 @@ export class Database {
         item_id TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
         file_stamp TEXT NOT NULL, fingerprint_json TEXT
       );
+      CREATE TABLE IF NOT EXISTS live_recording_state (
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        room_url TEXT NOT NULL, suppressed INTEGER NOT NULL DEFAULT 0,
+        offline INTEGER NOT NULL DEFAULT 0, retries INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(source_id,room_url)
+      );
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS live_cam_favorites (
         provider_id TEXT NOT NULL, username_key TEXT NOT NULL, cam_id TEXT NOT NULL, username TEXT NOT NULL,
@@ -496,6 +502,49 @@ export class Database {
     } catch (error) { this.sqlite.exec("ROLLBACK"); throw error; }
   }
 
+  // Source scans own live sessions: plugins do not open the application's database.
+  liveScanCandidates(source: Source, candidates: MediaCandidate[], nowMs = Date.now()): MediaCandidate[] {
+    if (!candidates.length) {
+      this.sqlite.prepare("UPDATE live_recording_state SET offline=1,suppressed=0,retries=0 WHERE source_id=?").run(source.id);
+      return candidates;
+    }
+    return candidates.flatMap((candidate) => {
+      if (candidate.metadata?.live !== true) return [candidate];
+      const room = candidate.pageUrl ?? source.profileUrl;
+      this.sqlite.prepare("INSERT OR IGNORE INTO live_recording_state(source_id,room_url) VALUES(?,?)").run(source.id, room);
+      const state = this.sqlite.prepare("SELECT * FROM live_recording_state WHERE source_id=? AND room_url=?").get(source.id, room) as any;
+      const previous = this.sqlite.prepare(`SELECT * FROM items WHERE source_id=? AND json_extract(metadata_json,'$.live')=1
+        AND COALESCE(page_url,?)=? ORDER BY CASE WHEN status IN ('available','queued','downloading','paused','stopping','cancelling') THEN 0 ELSE 1 END,
+        created_at DESC,rowid DESC LIMIT 1`).get(source.id, source.profileUrl, room) as any;
+      if (previous && ["available", "queued", "downloading", "paused", "stopping", "cancelling"].includes(previous.status)) return [];
+      if (state.suppressed || (previous && ["cancelled", "deleted"].includes(previous.status) && !state.offline)) return [];
+      if (!previous) {
+        this.sqlite.prepare("UPDATE live_recording_state SET offline=0 WHERE source_id=? AND room_url=?").run(source.id, room);
+        return [candidate];
+      }
+      const ended = Date.parse(previous.download_finished_at ?? previous.updated_at);
+      const started = Date.parse(previous.download_started_at ?? "");
+      const short = previous.status === "failed" || !Number.isFinite(started) || ended - started < 300_000;
+      const delay = Math.min(900_000, 45_000 * 2 ** Math.min(state.retries, 5));
+      if (!state.offline && short && (!Number.isFinite(ended) || nowMs - ended < delay)) return [];
+      const retries = short && !state.offline ? state.retries + 1 : 0;
+      this.sqlite.prepare("UPDATE live_recording_state SET offline=0,retries=? WHERE source_id=? AND room_url=?").run(retries, source.id, room);
+      const session = id("live");
+      const filename = path.parse(candidate.filename ?? "live.mp4");
+      return [{ ...candidate, externalId: `${candidate.externalId}#${session}`, identityKey: undefined,
+        filename: `${filename.name}-${session}${filename.ext}`, metadata: { ...candidate.metadata, session } }];
+    });
+  }
+
+  suppressLiveRecording(itemId: string) {
+    const item = this.getItem(itemId);
+    if (item?.metadata.live !== true) return;
+    const room = item.pageUrl ?? this.getSource(item.sourceId)?.profileUrl;
+    if (!room) return;
+    this.sqlite.prepare(`INSERT INTO live_recording_state(source_id,room_url,suppressed) VALUES(?,?,1)
+      ON CONFLICT(source_id,room_url) DO UPDATE SET suppressed=1,offline=0`).run(item.sourceId, room);
+  }
+
   ingestItems(source: Source, candidates: MediaCandidate[], onStoredDateChange?: (itemId: string, publishedAt: string) => void, ignoreDeletedHistory = false): { added: number; upgraded: number; skipped: number } {
     let added = 0, upgraded = 0, skipped = 0; const autoGlobal = !!this.getSettings().autoQueueDiscovered;
     for (const candidate of candidates) {
@@ -595,6 +644,7 @@ export class Database {
     const normalized = relativePath.replaceAll("\\", "/").replace(/^\.\//, "");
     const row = this.sqlite.prepare("SELECT id FROM items WHERE replace(storage_path,'\\','/')=? AND status='completed' ORDER BY updated_at DESC LIMIT 1").get(normalized) as { id: string } | undefined;
     if (!row) return undefined;
+    this.suppressLiveRecording(row.id);
     this.sqlite.prepare("UPDATE items SET status='deleted',progress=1,error=NULL,updated_at=? WHERE id=?").run(now(), row.id);
     return this.getItem(row.id);
   }
@@ -693,6 +743,7 @@ export class Database {
   }
 
   deleteItem(itemId: string) {
+    this.suppressLiveRecording(itemId);
     return Number(this.sqlite.prepare("DELETE FROM items WHERE id=?").run(itemId).changes) > 0;
   }
 
