@@ -7,7 +7,7 @@ import fastifyHttpProxy from "@fastify/http-proxy";
 import fastifyStatic from "@fastify/static";
 import pino from "pino";
 import { z } from "zod";
-import { Database } from "./database.js";
+import { Database, PERFORMER_PRIORITIES } from "./database.js";
 import { PluginManager, pluginMatchesSource } from "./plugin-manager.js";
 import { DownloadQueue } from "./downloader.js";
 import { discoverPeople } from "./discovery.js";
@@ -481,6 +481,12 @@ app.post("/api/performers/refresh", async () => {
   } finally {
     performerRefreshStatus.running = false;
   }
+});
+app.put<{ Params: { id: string }; Body: unknown }>("/api/performers/:id/priority", async (request) => {
+  const body = z.object({ priority: z.enum(["low", "normal", "high"]) }).parse(request.body);
+  const performer = db.setPerformerPriority(request.params.id, PERFORMER_PRIORITIES[body.priority]);
+  if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
+  return performer;
 });
 app.post<{ Params: { id: string } }>("/api/performers/:id/refresh", async (request) => {
   return refreshPerformer(request.params.id);
