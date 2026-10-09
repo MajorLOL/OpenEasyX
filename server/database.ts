@@ -11,8 +11,12 @@ import { PerformerConflictError } from "./performer-conflict.js";
 
 export type Performer = {
   id: string; name: string; aliases: string[]; imageUrl?: string; externalRefs: Record<string, string>;
+  /** Recording priority: -1 low, 0 normal, 1 high. Higher priorities start first and may preempt lower live recordings. */
+  priority?: number;
   createdAt: string; updatedAt: string;
 };
+
+export const PERFORMER_PRIORITIES = { low: -1, normal: 0, high: 1 } as const;
 
 export type Source = {
   id: string; performerId: string; pluginId: string; externalId: string; label: string;
@@ -127,6 +131,8 @@ export class Database {
         PRIMARY KEY(provider_id, username_key)
       );
     `);
+    const performerColumns = new Set((this.sqlite.prepare("PRAGMA table_info(performers)").all() as Array<{ name: string }>).map((column) => column.name));
+    if (!performerColumns.has("priority")) this.sqlite.exec("ALTER TABLE performers ADD COLUMN priority INTEGER NOT NULL DEFAULT 0");
     const sourceColumns = new Set((this.sqlite.prepare("PRAGMA table_info(sources)").all() as Array<{ name: string }>).map((column) => column.name));
     if (!sourceColumns.has("profile_key")) this.sqlite.exec("ALTER TABLE sources ADD COLUMN profile_key TEXT");
     for (const source of this.sqlite.prepare("SELECT id,profile_url FROM sources WHERE profile_key IS NULL").all() as Array<{ id: string; profile_url: string }>) {
@@ -322,7 +328,7 @@ export class Database {
     const mergedName = this.resolvePerformerName(values.name);
     if (mergedName !== values.name) throw Object.assign(new Error(`This name belongs to the merged profile ${mergedName}`), { statusCode: 409 });
     const performerId = id("person"); const stamp = now();
-    this.sqlite.prepare("INSERT INTO performers VALUES(?,?,?,?,?,?,?)")
+    this.sqlite.prepare("INSERT INTO performers(id,name,aliases_json,image_url,external_refs_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
       .run(performerId, values.name, JSON.stringify(values.aliases ?? []), values.imageUrl ?? null, "{}", stamp, stamp);
     return this.getPerformer(performerId)!;
   }
@@ -333,6 +339,49 @@ export class Database {
     this.sqlite.prepare("UPDATE performers SET name=?,aliases_json=?,image_url=?,updated_at=? WHERE id=?")
       .run(values.name, JSON.stringify(values.aliases ?? []), values.imageUrl ?? null, now(), performerId);
     return this.getPerformer(performerId);
+  }
+
+  /** Merges imported details into a performer: aliases and links are added, an existing image is kept. */
+  mergePerformerDetails(performerId: string, values: { aliases?: string[]; imageUrl?: string; externalRefs?: Record<string, string>; identities?: Array<{ pluginId: string; externalId: string }> }): Performer | undefined {
+    const performer = this.getPerformer(performerId);
+    if (!performer) return undefined;
+    const aliases = [...new Map([...performer.aliases, ...(values.aliases ?? [])]
+      .filter((alias) => typeof alias === "string" && alias.trim() && alias.toLowerCase() !== performer.name.toLowerCase())
+      .map((alias) => [alias.toLowerCase(), alias])).values()];
+    const identities = [...Object.entries(values.externalRefs ?? {}).map(([pluginId, externalId]) => ({ pluginId, externalId })), ...(values.identities ?? [])];
+    for (const { pluginId, externalId } of identities) {
+      const owner = this.findPerformerByIdentity(pluginId, externalId);
+      if (owner && owner.id !== performerId) throw new PerformerConflictError({ performerId, existingPerformer: owner });
+    }
+    const refs = { ...Object.fromEntries(Object.entries(values.externalRefs ?? {}).filter(([, value]) => typeof value === "string" && value)), ...performer.externalRefs };
+    this.sqlite.prepare("UPDATE performers SET aliases_json=?,image_url=COALESCE(image_url,?),external_refs_json=?,updated_at=? WHERE id=?")
+      .run(JSON.stringify(aliases), values.imageUrl ?? null, JSON.stringify(refs), now(), performerId);
+    const identity = this.sqlite.prepare("INSERT OR IGNORE INTO performer_identities(performer_id,plugin_id,external_id) VALUES(?,?,?)");
+    for (const { pluginId, externalId } of identities) identity.run(performerId, pluginId, externalId);
+    return this.getPerformer(performerId);
+  }
+
+  performerIdentities(performerId: string): Array<{ pluginId: string; externalId: string }> {
+    return this.sqlite.prepare("SELECT plugin_id AS pluginId, external_id AS externalId FROM performer_identities WHERE performer_id=? ORDER BY plugin_id,external_id").all(performerId) as Array<{ pluginId: string; externalId: string }>;
+  }
+
+  setPerformerPriority(performerId: string, priority: number): Performer | undefined {
+    const value = Math.max(-1, Math.min(1, Math.trunc(priority)));
+    this.sqlite.prepare("UPDATE performers SET priority=?,updated_at=? WHERE id=?").run(value, now(), performerId);
+    return this.getPerformer(performerId);
+  }
+
+  /** Recording priority of the performer an item belongs to (0 when unknown). */
+  itemPriority(itemId: string): number {
+    const row = this.sqlite.prepare("SELECT p.priority FROM items i LEFT JOIN performers p ON p.id=i.performer_id WHERE i.id=?").get(itemId) as { priority: number | null } | undefined;
+    return Number(row?.priority ?? 0) || 0;
+  }
+
+  /** Priorities of queued live recordings, highest first. */
+  queuedLivePriorities(): number[] {
+    return (this.sqlite.prepare(`SELECT COALESCE(p.priority,0) AS priority FROM items i LEFT JOIN performers p ON p.id=i.performer_id
+      WHERE i.status='queued' AND json_extract(i.metadata_json,'$.live')=1 ORDER BY priority DESC, i.created_at`).all() as Array<{ priority: number }>)
+      .map((row) => Number(row.priority) || 0);
   }
 
   deletePerformer(performerId: string): boolean {
@@ -403,7 +452,7 @@ export class Database {
       return this.getPerformer(existing.id)!;
     }
     const performerId = id("person");
-    this.sqlite.prepare("INSERT INTO performers VALUES(?,?,?,?,?,?,?)")
+    this.sqlite.prepare("INSERT INTO performers(id,name,aliases_json,image_url,external_refs_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
       .run(performerId, candidate.name, JSON.stringify(candidate.aliases ?? []), candidate.imageUrl ?? null, JSON.stringify({ [pluginId]: candidate.externalId }), stamp, stamp);
     this.sqlite.prepare("INSERT OR IGNORE INTO performer_identities VALUES(?,?,?)").run(performerId, pluginId, candidate.externalId);
     return this.getPerformer(performerId)!;
@@ -411,7 +460,7 @@ export class Database {
 
   private mapPerformer(row: any): Performer {
     return { id: row.id, name: row.name, aliases: asJson(row.aliases_json, []), imageUrl: row.image_url ?? undefined,
-      externalRefs: asJson(row.external_refs_json, {}), createdAt: row.created_at, updatedAt: row.updated_at };
+      externalRefs: asJson(row.external_refs_json, {}), priority: Number(row.priority ?? 0) || 0, createdAt: row.created_at, updatedAt: row.updated_at };
   }
 
   addSource(performerId: string, pluginId: string, candidate: SourceCandidate): Source {
@@ -650,7 +699,9 @@ export class Database {
   }
 
   nextQueued(): DownloadItem | undefined {
-    const row = this.sqlite.prepare("SELECT * FROM items WHERE status='queued' ORDER BY created_at LIMIT 1").get() as any;
+    // Highest performer priority first, then oldest.
+    const row = this.sqlite.prepare(`SELECT i.* FROM items i LEFT JOIN performers p ON p.id=i.performer_id
+      WHERE i.status='queued' ORDER BY COALESCE(p.priority,0) DESC, i.created_at LIMIT 1`).get() as any;
     return row ? this.mapItem(row) : undefined;
   }
 

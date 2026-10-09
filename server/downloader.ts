@@ -14,7 +14,9 @@ import { downloadOutputPath, recordingEncodingArgs } from "./output-settings.js"
 import { outputSettings } from "../packages/output-settings.js";
 import { canMatchVideoExcerpt, fingerprintVideo, verifyVideoContainment, videoFileStamp, type VideoFingerprint } from "./video-matching.js";
 
-type ActiveDownload = { child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; matching?: boolean; action?: "stop" | "cancel" | "delete" };
+type ActiveDownload = {
+  /** Live recording of a performer with this priority; preempted when a higher one has to wait for a slot. */
+  live?: boolean; priority?: number; startedAt?: number; preempted?: boolean; child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; matching?: boolean; action?: "stop" | "cancel" | "delete" };
 
 export class DownloadQueue {
   private active = new Map<string, ActiveDownload>();
@@ -108,12 +110,39 @@ export class DownloadQueue {
     const max = concurrentDownloads(this.db.getSettings().maxConcurrentDownloads);
     while (this.active.size < max) {
       const item = this.db.nextQueued();
-      if (!item || this.active.has(item.id)) return;
-      const control: ActiveDownload = { paused: false };
+      if (!item || this.active.has(item.id)) break;
+      const control: ActiveDownload = { paused: false, live: item.metadata.live === true, priority: this.db.itemPriority(item.id), startedAt: Date.now() };
       this.active.set(item.id, control);
       const startedItem = this.db.setItemStatus(item.id, "downloading", { progress: 0 })!;
       this.writeLog?.("info", "download", "Download started", { itemId: item.id, pluginId: item.pluginId, title: item.title, mediaType: item.mediaType });
       void this.download(startedItem, control).finally(() => this.active.delete(item.id));
+    }
+    if (this.active.size >= max) this.preemptForPriority();
+  }
+
+  /**
+   * All slots are busy and a live recording of a higher-priority performer is waiting:
+   * stop the lowest-priority live recording (latest started first) so the waiting one
+   * gets its slot. The stopped recording is kept, and the room is not suppressed, so
+   * it is recorded again once a slot is free. Recordings already being stopped for a
+   * waiting item are counted, so one waiting item never stops two recordings.
+   */
+  private preemptForPriority() {
+    const waiting = this.db.queuedLivePriorities();
+    if (!waiting.length) return;
+    for (const [itemId, control] of this.active) control.priority = this.db.itemPriority(itemId);
+    let freeing = [...this.active.values()].filter((control) => control.preempted || control.action).length;
+    for (const priority of waiting) {
+      if (freeing > 0) { freeing -= 1; continue; }
+      const victim = [...this.active.entries()]
+        .filter(([, control]) => control.live && !control.preempted && !control.action && !control.paused && !control.encoding && !control.matching && (control.priority ?? 0) < priority)
+        .sort(([, left], [, right]) => (left.priority ?? 0) - (right.priority ?? 0) || (right.startedAt ?? 0) - (left.startedAt ?? 0))[0];
+      if (!victim) return;
+      const [itemId, control] = victim;
+      control.preempted = true; control.action = "stop";
+      this.signal(control, "SIGCONT"); this.signal(control, "SIGINT"); control.abort?.abort();
+      const item = this.db.setItemStatus(itemId, "stopping");
+      this.writeLog?.("info", "download", "Recording stopped for a higher-priority performer", { itemId, title: item?.title, priority: control.priority ?? 0, waitingPriority: priority });
     }
   }
 
@@ -269,7 +298,11 @@ export class DownloadQueue {
           message += ` Recording preserved in staging at ${path.relative(this.mediaRoot, temporary)}; recover it before retrying.`;
         }
       }
-      if (control.action) {
+      if (control.preempted && control.action === "stop") {
+        // Not a user action: keep the room eligible for a new session once a slot is free.
+        this.db.setItemStatus(item.id, "failed", { error: "Stopped for a higher-priority performer" });
+        this.writeLog?.("info", "download", "Recording stopped for a higher-priority performer", { itemId: item.id, title: item.title });
+      } else if (control.action) {
         if (control.action !== "delete") this.db.setItemStatus(item.id, "cancelled", { error: null });
         this.writeLog?.("info", "download", control.action === "stop" ? "Recording stopped" : "Download cancelled", { itemId: item.id, title: item.title });
       } else {

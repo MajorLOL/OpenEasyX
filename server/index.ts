@@ -7,7 +7,7 @@ import fastifyHttpProxy from "@fastify/http-proxy";
 import fastifyStatic from "@fastify/static";
 import pino from "pino";
 import { z } from "zod";
-import { Database } from "./database.js";
+import { Database, PERFORMER_PRIORITIES } from "./database.js";
 import { PluginManager, pluginMatchesSource } from "./plugin-manager.js";
 import { DownloadQueue } from "./downloader.js";
 import { discoverPeople } from "./discovery.js";
@@ -23,6 +23,7 @@ import { LibraryDatabase } from "./library-database.js";
 import { Catalog } from "./catalog.js";
 import { registerLibraryRoutes } from "./library-routes.js";
 import { settingsSchema } from "./output-settings.js";
+import { exportBackup, importBackup, parseBackup } from "./backup.js";
 import { SourceSync } from "./source-sync.js";
 import { PerformerConflictError } from "./performer-conflict.js";
 import { registerPerformerMergeRoutes } from "./performer-merge-routes.js";
@@ -482,6 +483,14 @@ app.post("/api/performers/refresh", async () => {
     performerRefreshStatus.running = false;
   }
 });
+app.put<{ Params: { id: string }; Body: unknown }>("/api/performers/:id/priority", async (request) => {
+  const parsed = z.object({ priority: z.enum(["low", "normal", "high"]) }).safeParse(request.body);
+  if (!parsed.success) throw Object.assign(new Error("Choose a recording priority of low, normal or high"), { statusCode: 400 });
+  const body = parsed.data;
+  const performer = db.setPerformerPriority(request.params.id, PERFORMER_PRIORITIES[body.priority]);
+  if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
+  return performer;
+});
 app.post<{ Params: { id: string } }>("/api/performers/:id/refresh", async (request) => {
   return refreshPerformer(request.params.id);
 });
@@ -589,6 +598,20 @@ app.post<{ Params: { id: string } }>("/api/items/:id/cancel", async (request) =>
 app.delete<{ Params: { id: string } }>("/api/items/:id", async (request) => queue.delete(request.params.id));
 
 app.get("/api/settings", async () => ({ ...db.getSettings(), mediaRoot: mediaDir, ...library.settings(), maxConcurrentDownloadsLimit }));
+app.get("/api/backup/export", async (_request, reply) => {
+  const backup = exportBackup(db, plugins, process.env.APP_VERSION);
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, "").replace("T", "-");
+  reply.header("content-disposition", `attachment; filename="open-easyx-backup-${stamp}.json"`);
+  reply.type("application/json; charset=utf-8");
+  return JSON.stringify(backup, null, 2);
+});
+app.post<{ Body: unknown; Querystring: { settings?: string; plugins?: string } }>("/api/backup/import", { bodyLimit: 32 * 1024 * 1024 }, async (request) => {
+  const backup = parseBackup(request.body);
+  const off = (value?: string) => value === "0" || value === "false";
+  const result = importBackup(db, plugins, backup, { settings: !off(request.query.settings), plugins: !off(request.query.plugins) });
+  app.log.info({ scope: "backup", performers: result.performers, sourcesAdded: result.sources.added, sourcesSkipped: result.sources.skipped.length }, "Backup imported");
+  return result;
+});
 app.put<{ Body: Record<string, unknown> }>("/api/settings", async (request) => {
   const parsed = settingsSchema.safeParse(request.body);
   if (!parsed.success) throw Object.assign(new Error(parsed.error.issues.map((issue) => issue.message).join(" ")), { statusCode: 400 });
