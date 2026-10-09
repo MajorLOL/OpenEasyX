@@ -484,7 +484,9 @@ app.post("/api/performers/refresh", async () => {
   }
 });
 app.put<{ Params: { id: string }; Body: unknown }>("/api/performers/:id/priority", async (request) => {
-  const body = z.object({ priority: z.enum(["low", "normal", "high"]) }).parse(request.body);
+  const parsed = z.object({ priority: z.enum(["low", "normal", "high"]) }).safeParse(request.body);
+  if (!parsed.success) throw Object.assign(new Error("Choose a recording priority of low, normal or high"), { statusCode: 400 });
+  const body = parsed.data;
   const performer = db.setPerformerPriority(request.params.id, PERFORMER_PRIORITIES[body.priority]);
   if (!performer) throw Object.assign(new Error("Performer not found"), { statusCode: 404 });
   return performer;

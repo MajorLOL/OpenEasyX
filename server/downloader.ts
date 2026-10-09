@@ -130,7 +130,8 @@ export class DownloadQueue {
   private preemptForPriority() {
     const waiting = this.db.queuedLivePriorities();
     if (!waiting.length) return;
-    let freeing = [...this.active.values()].filter((control) => control.preempted).length;
+    for (const [itemId, control] of this.active) control.priority = this.db.itemPriority(itemId);
+    let freeing = [...this.active.values()].filter((control) => control.preempted || control.action).length;
     for (const priority of waiting) {
       if (freeing > 0) { freeing -= 1; continue; }
       const victim = [...this.active.entries()]

@@ -459,12 +459,17 @@ export function stripchatModelsInState(state: unknown, username: string): Record
 
 export function stripchatModelFromPage(html: string, username: string): StripchatModel | undefined {
   const models = stripchatModelsInState(preloadedState(html), username);
-  if (!models.length || models.every((item) => item.isModel === false)) return undefined;
+  const state = preloadedState(html) as { viewCam?: { model?: Record<string, unknown> } } | undefined;
+  const roomModel = state?.viewCam?.model;
+  const confirmed = models.some((item) => item.isModel === true)
+    || (roomModel && roomModel.isModel !== false && String(roomModel.username ?? roomModel.login ?? "").toLowerCase() === username.toLowerCase());
+  if (!models.length || !confirmed) return undefined;
   const pick = (key: string) => models.map((item) => textValue(item[key])).find(Boolean);
   return {
     username: pick("username") ?? pick("login") ?? username,
     avatarUrl: pick("avatarUrl") ?? pick("previewUrlThumbSmall") ?? pick("previewUrl"),
-    online: models.some((item) => item.isLive === true || item.isOnline === true) || undefined,
+    online: models.some((item) => item.isLive === true || item.isOnline === true) ? true
+      : models.some((item) => item.isLive === false || item.isOnline === false) ? false : undefined,
     gender: pick("gender"), country: pick("country"),
   };
 }
@@ -500,7 +505,7 @@ export async function searchStripchatPeople(context: PluginContext, query: strin
     try {
       const model = await stripchatModelByUsername(context, username);
       if (model) results.set(model.username.toLowerCase(), personFromModel(model));
-    } catch (error) { firstError ??= error; }
+    } catch (error) { context.signal?.throwIfAborted(); firstError ??= error; }
   }
   if (!results.size && firstError) throw firstError instanceof Error ? firstError : new Error(String(firstError));
   return [...results.values()];
@@ -509,7 +514,7 @@ export async function searchStripchatPeople(context: PluginContext, query: strin
 /** Adds the Stripchat room of a performer picked in "Find a performer" (or linked to Stripchat before). */
 export async function discoverStripchatSources(_context: PluginContext, performer: PerformerRecord): Promise<SourceCandidate[]> {
   const linked = textValue(performer.externalRefs?.["org.easyx.stripchat"]);
-  const found = linked ? stripchatSearchUsernames(linked)[0] : undefined;
+  const found = linked ? stripchatSearchUsernames(linked.replace(/^live:/i, ""))[0] : undefined;
   if (!found) return [];
   // Prefer the spelling of the performer name (the stored reference is lower case).
   const username = performer.name.toLowerCase() === found.toLowerCase() ? performer.name : found;

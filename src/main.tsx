@@ -554,6 +554,7 @@ function PluginConfig({ plugin, installing, close, run }: { plugin: Plugin; inst
 
 function SettingsPage({ settings, run, setNotice, onSettingsChange }: { settings: Record<string, any>; run: (op: () => Promise<unknown>, msg: string) => Promise<void>; setNotice: (text: string) => void; onSettingsChange: (settings: Record<string, unknown>) => void }) {
   const [values, setValues] = useState(settings);
+  useEffect(() => setValues(settings), [settings]);
   const [category, setCategory] = useState<"automation" | "storage" | "subtitles" | "backup">("automation");
   const categories = [
     { key: "automation", label: "Automation", description: "Discovery and downloads", icon: Gauge },
@@ -569,7 +570,7 @@ function SettingsPage({ settings, run, setNotice, onSettingsChange }: { settings
       <div className="settings-category-content">
         {category === "automation" && <section className="panel"><div className="panel-head"><div><p>AUTOMATION</p><h3>Scraping and downloads</h3></div></div><div className="form-stack"><label><span>Default periodic scrape interval (minutes)</span><input type="number" min="5" value={values.defaultScrapeIntervalMinutes ?? 360} onChange={(e) => setValues({ ...values, defaultScrapeIntervalMinutes: Number(e.target.value) })}/><small>Fallback for plugins that do not publish a recommended schedule. Each performer URL can override it.</small></label><label><span>Default live check interval (seconds)</span><input type="number" min="5" max="3600" value={values.defaultLiveIntervalSeconds ?? 10} onChange={(e) => setValues({ ...values, defaultLiveIntervalSeconds: Number(e.target.value) })}/><small>Reserved for live-aware plugins. A plugin can enforce a safer minimum interval.</small></label><label><span>Maximum concurrent downloads</span><input type="number" min="1" max={Number(values.maxConcurrentDownloadsLimit ?? 8)} value={values.maxConcurrentDownloads ?? 2} onChange={(e) => setValues({ ...values, maxConcurrentDownloads: Number(e.target.value) })}/><small>Keep this low on slower storage or connections.</small></label><label className="toggle-row"><span><b>Automatically queue discovered media</b><small>New items from every source are queued without review.</small></span><input type="checkbox" checked={!!values.autoQueueDiscovered} onChange={(e) => setValues({ ...values, autoQueueDiscovered: e.target.checked })}/></label><label><span>Retention period (days)</span><input type="number" min="0" value={values.retentionDays ?? 0} onChange={(e) => setValues({ ...values, retentionDays: Number(e.target.value) })}/><small>Reserved for retention policies. Use 0 to keep files indefinitely.</small></label></div><button className="primary" onClick={saveAutomation}><Check size={16}/>Save changes</button></section>}
         {category === "storage" && <OutputSettings settings={settings} setNotice={setNotice} onSaved={onSettingsChange}/>}
-        {category === "backup" && <BackupSettings setNotice={setNotice} onImported={() => window.location.reload()}/>}
+        {category === "backup" && <BackupSettings setNotice={setNotice} onImported={() => { void run(async () => {}, "Backup imported"); }}/>}
         {category === "subtitles" && <div className="library-mode embedded-subtitle-settings"><SubtitleSettingsPage setNotice={setNotice} embedded/></div>}
       </div>
     </div>

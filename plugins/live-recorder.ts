@@ -3,8 +3,9 @@ export const LIVE_RECORDER_SCRIPT = String.raw`
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
-const [mediaUrl, masterUrl, headersJson, output, gapArg, pollArg, userAgent] = process.argv.slice(1);
+const [mediaUrl, masterUrl, headersJson, output, gapArg, pollArg, userAgent, refreshUrl, refreshField] = process.argv.slice(1);
 const headers = JSON.parse(headersJson);
+let currentMasterUrl = masterUrl;
 const gapMs = Number(gapArg) || 0;
 const pollMs = Number(pollArg) || 20000;
 const partsDir = path.join(path.dirname(output), "live-parts");
@@ -28,17 +29,25 @@ async function get(url) {
   const response = await fetch(url, { headers: { ...headers, "user-agent": userAgent }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]) });
   return response.ok ? response.text() : undefined;
 }
-async function variants() {
-  const text = await get(masterUrl);
+async function variants(refresh = false) {
+  if (refresh && refreshUrl && refreshField) {
+    const body = await get(refreshUrl);
+    if (!body) return [];
+    const data = JSON.parse(body);
+    const next = data && data[refreshField];
+    if (typeof next !== "string" || !/^https?:\/\//i.test(next)) return [];
+    currentMasterUrl = next;
+  }
+  const text = await get(currentMasterUrl);
   if (!text || !text.trimStart().startsWith("#EXTM3U") || text.includes("#EXT-X-MOUFLON-ADVERT")) return [];
-  if (isLive(text)) return [{ url: masterUrl, resolution: "", bandwidth: 0 }];
-  const pkey = new URL(masterUrl).searchParams.get("pkey");
+  if (isLive(text)) return [{ url: currentMasterUrl, resolution: "", bandwidth: 0 }];
+  const pkey = new URL(currentMasterUrl).searchParams.get("pkey");
   const list = []; let info = "";
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
     if (line.startsWith("#EXT-X-STREAM-INF")) { info = line; continue; }
     if (!line || line.startsWith("#") || !/\.m3u8(?:$|\?)/i.test(line)) continue;
-    const url = new URL(line, masterUrl);
+    const url = new URL(line, currentMasterUrl);
     if (pkey && !url.searchParams.has("pkey")) url.searchParams.set("pkey", pkey);
     list.push({ url: url.toString(), bandwidth: Number((info.match(/(?:^|[:,])BANDWIDTH=(\d+)/i) || [])[1] || 0), resolution: (info.match(/RESOLUTION=(\d+x\d+)/i) || [])[1] || "" });
     info = "";
@@ -46,7 +55,7 @@ async function variants() {
   return list.sort((a, b) => b.bandwidth - a.bandwidth);
 }
 async function liveVariant(resolution) {
-  const list = await variants();
+  const list = await variants(true);
   const ordered = resolution ? list.filter((item) => item.resolution === resolution) : list;
   for (const item of ordered) {
     try { const text = await get(item.url); if (text && isLive(text)) return item; } catch {}

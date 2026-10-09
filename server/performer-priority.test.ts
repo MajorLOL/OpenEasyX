@@ -86,6 +86,20 @@ describe("performer recording priority", () => {
     } finally { queue.stop(); db.close(); }
   });
 
+  it("uses priority changes made while a recording is already running", { timeout: 30_000 }, async () => {
+    const { db, queue, record, recording } = await setup(); queue.start();
+    try {
+      const bob = record("bob"); await waitFor(() => recording(bob));
+      db.setPerformerPriority(db.getItem(bob)!.performerId, 1);
+      const alice = record("alice", 1);
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      expect(db.getItem(bob)?.status).toBe("downloading"); expect(db.getItem(alice)?.status).toBe("queued");
+      db.setPerformerPriority(db.getItem(bob)!.performerId, -1);
+      await waitFor(() => recording(alice)); await waitFor(() => db.getItem(bob)?.status === "completed");
+      queue.stopRecording(alice); await waitFor(() => db.getItem(alice)?.status === "completed");
+    } finally { queue.stop(); db.close(); }
+  });
+
   it("does not stop a recording for an equal or lower priority", { timeout: 60_000 }, async () => {
     const { db, queue, record, recording } = await setup();
     queue.start();

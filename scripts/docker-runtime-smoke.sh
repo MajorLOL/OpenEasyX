@@ -25,6 +25,8 @@ for attempt in {1..20}; do
   sleep 1
 done
 
+# The dependency overrides must preserve the imports used by the authentication helper.
+docker exec "$container" /opt/ofscraper/bin/python -c 'from ofscraper.main.open import load; from ofscraper.data.api.init import getstatus; import idna, lxml.etree; print("OF-Scraper imports OK", idna.__version__, lxml.etree.LXML_VERSION)'
 docker exec "$container" sh -lc 'test "$(awk "/^Uid:/ { print \$2 }" /proc/1/status)" = 99 && test "$(cat /proc/1/comm)" = tini'
 docker exec "$container" sh -lc 'test -w /data && test -f /data/easyx.sqlite && test -f /data/open-easyx-library.sqlite'
 docker exec -e EXPECTED_VERSION="$version" "$container" node -e "fetch('http://127.0.0.1:3210/api/health').then(r=>r.json()).then(v=>{if(v.product!=='Open EasyX'||!v.ok||v.version!==process.env.EXPECTED_VERSION)throw Error(JSON.stringify(v))})"

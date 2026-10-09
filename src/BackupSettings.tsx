@@ -3,8 +3,8 @@ import { Download, LoaderCircle, Upload } from "lucide-react";
 import { api } from "./api";
 
 type ImportResult = {
-  performers: { created: number; updated: number };
-  sources: { added: number; updated: number; skipped: Array<{ performer: string; profileUrl: string; reason: string }> };
+  performers: { created: number; updated: number; skipped: Array<{ name: string; reason: string }> };
+  sources: { added: number; updated: number; warnings: Array<{ performer: string; profileUrl: string; reason: string }>; skipped: Array<{ performer: string; profileUrl: string; reason: string }> };
   settings: { applied: string[]; skipped: string[] };
   plugins: { installed: string[]; skipped: Array<{ id: string; reason: string }> };
 };
@@ -15,6 +15,7 @@ export function importSummary(result: ImportResult): string {
     `${result.performers.updated} updated`,
     `${result.sources.added} source${result.sources.added === 1 ? "" : "s"} added`,
   ];
+  if (result.performers.skipped.length) parts.push(`${result.performers.skipped.length} performer conflicts`);
   if (result.sources.skipped.length) parts.push(`${result.sources.skipped.length} skipped`);
   if (result.plugins.installed.length) parts.push(`${result.plugins.installed.length} plugin${result.plugins.installed.length === 1 ? "" : "s"} installed`);
   return `Import finished: ${parts.join(", ")}.`;
@@ -29,6 +30,7 @@ export function BackupSettings({ setNotice, onImported }: { setNotice: (message:
   const importFile = async (file: File) => {
     setBusy(true); setError(""); setResult(undefined);
     try {
+      if (file.size > 32 * 1024 * 1024) throw new Error("Backup files must be smaller than 32 MB");
       let backup: unknown;
       try { backup = JSON.parse(await file.text()); } catch { throw new Error("This file is not valid JSON"); }
       const query = new URLSearchParams({ settings: includeSettings ? "1" : "0", plugins: includePlugins ? "1" : "0" });
@@ -48,7 +50,7 @@ export function BackupSettings({ setNotice, onImported }: { setNotice: (message:
       <label className="check-row"><input type="checkbox" checked={includeSettings} onChange={(event) => setIncludeSettings(event.target.checked)}/><span>Also import settings</span></label>
       <label className="check-row"><input type="checkbox" checked={includePlugins} onChange={(event) => setIncludePlugins(event.target.checked)}/><span>Also install plugins that are missing</span></label>
     </div>
-    <p className="muted">Importing adds to your current library and never deletes anything. Performers are matched by name and sources by account, so importing the same file again does not create duplicates.</p>
+    <p className="muted">Importing adds to your current library and never deletes anything. Performers are matched by name or linked account and sources by account, so importing the same file again does not create duplicates.</p>
     <div className="backup-actions">
       <input ref={input} type="file" accept="application/json,.json" hidden aria-label="Backup file" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importFile(file); }}/>
       <button className="secondary" disabled={busy} onClick={() => input.current?.click()}>{busy ? <LoaderCircle size={14} className="spin"/> : <Upload size={14}/>}{busy ? "Importing…" : "Import backup"}</button>
@@ -56,6 +58,9 @@ export function BackupSettings({ setNotice, onImported }: { setNotice: (message:
     {error && <p className="row-error" role="alert">{error}</p>}
     {result && <div className="backup-result" role="status">
       <p>{importSummary(result)}</p>
+      {result.performers.skipped.length > 0 && <ul>{result.performers.skipped.map((skip) => <li key={skip.name}><b>{skip.name}</b>: {skip.reason}</li>)}</ul>}
+      {result.sources.warnings.length > 0 && <ul>{result.sources.warnings.map((warning, index) => <li key={index}><b>{warning.performer}</b>: {warning.reason}</li>)}</ul>}
+      {result.settings.skipped.length > 0 && <p>Settings not imported: {result.settings.skipped.join(", ")}</p>}
       {result.sources.skipped.length > 0 && <ul>{result.sources.skipped.map((skip) => <li key={`${skip.performer}-${skip.profileUrl}`}><b>{skip.performer}</b>: {skip.profileUrl} — {skip.reason}</li>)}</ul>}
       {result.plugins.skipped.length > 0 && <ul>{result.plugins.skipped.map((skip) => <li key={skip.id}><b>{skip.id}</b>: {skip.reason}</li>)}</ul>}
     </div>}

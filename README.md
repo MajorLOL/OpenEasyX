@@ -104,7 +104,7 @@ For JavLibrary, see [Connect FlareSolverr](docs/FLARESOLVERR.md) for an existing
 
 Set `EASYX_MAX_CONCURRENT_DOWNLOADS_LIMIT` to a positive integer (default `8`) to raise the ceiling of **Settings → Automation → Maximum concurrent downloads**. Restart the server after changing it, then save the desired concurrency in Settings. Invalid values fall back to 8; the API, input and download queue share the same ceiling.
 
-Stripchat and BongaCams recordings can span short interruptions. `STRIPCHAT_MERGE_GAP_MINUTES` and `BONGACAMS_MERGE_GAP_MINUTES` default to 10; set either to `0` to finalize as soon as its stream ends. BongaCams falls back to the Stripchat value when its own variable is unset. Waiting recordings occupy a download slot. Automatic recording restarts after a completed or failed session, with backoff for short/failed recordings. A manual stop, cancel or deletion stays suppressed until a successful scan observes the room offline or non-public, including across app restarts.
+Stripchat, BongaCams and CAM4 recordings can span short interruptions. `STRIPCHAT_MERGE_GAP_MINUTES`, `BONGACAMS_MERGE_GAP_MINUTES` and `CAM4_MERGE_GAP_MINUTES` default to 10; set any of them to `0` to finalize as soon as its stream ends. BongaCams and CAM4 fall back to the Stripchat value when their own variable is unset. Waiting recordings occupy a download slot. Automatic recording restarts after a completed or failed session, with backoff for short/failed recordings. A manual stop, cancel or deletion stays suppressed until a successful scan observes the room offline or non-public, including across app restarts.
 
 Important environment variables include `PUID`, `PGID`, `EASYX_SCAN_INTERVAL_MINUTES`, `EASYX_WHISPER_MODEL`, `EASYX_TRANSLATION_MODEL`, and `EASYX_LOG_LEVEL`.
 
@@ -125,3 +125,7 @@ Only download, retain, and view material you are legally authorized to access. T
 ## License
 
 [MIT](LICENSE)
+
+Settings → Backup exports your performer directory, source URLs, recording priorities, supported app settings and installed plugin IDs. Media files, local portraits, playback history and plugin credentials are excluded. Import merges records by name or linked account, reports conflicts and skipped settings, and keeps the result visible. Back up the data and media volumes separately for a complete recovery.
+
+A performer’s recording priority can be changed under Manage profile. Higher priorities start first and can stop a lower-priority live recording when all slots are occupied; the captured recording is kept. Paused recordings, file downloads and finalization are not interrupted.

@@ -342,21 +342,27 @@ export class Database {
   }
 
   /** Merges imported details into a performer: aliases and links are added, an existing image is kept. */
-  mergePerformerDetails(performerId: string, values: { aliases?: string[]; imageUrl?: string; externalRefs?: Record<string, string> }): Performer | undefined {
+  mergePerformerDetails(performerId: string, values: { aliases?: string[]; imageUrl?: string; externalRefs?: Record<string, string>; identities?: Array<{ pluginId: string; externalId: string }> }): Performer | undefined {
     const performer = this.getPerformer(performerId);
     if (!performer) return undefined;
     const aliases = [...new Map([...performer.aliases, ...(values.aliases ?? [])]
       .filter((alias) => typeof alias === "string" && alias.trim() && alias.toLowerCase() !== performer.name.toLowerCase())
       .map((alias) => [alias.toLowerCase(), alias])).values()];
+    const identities = [...Object.entries(values.externalRefs ?? {}).map(([pluginId, externalId]) => ({ pluginId, externalId })), ...(values.identities ?? [])];
+    for (const { pluginId, externalId } of identities) {
+      const owner = this.findPerformerByIdentity(pluginId, externalId);
+      if (owner && owner.id !== performerId) throw new PerformerConflictError({ performerId, existingPerformer: owner });
+    }
     const refs = { ...Object.fromEntries(Object.entries(values.externalRefs ?? {}).filter(([, value]) => typeof value === "string" && value)), ...performer.externalRefs };
     this.sqlite.prepare("UPDATE performers SET aliases_json=?,image_url=COALESCE(image_url,?),external_refs_json=?,updated_at=? WHERE id=?")
       .run(JSON.stringify(aliases), values.imageUrl ?? null, JSON.stringify(refs), now(), performerId);
     const identity = this.sqlite.prepare("INSERT OR IGNORE INTO performer_identities(performer_id,plugin_id,external_id) VALUES(?,?,?)");
-    for (const [pluginId, externalId] of Object.entries(refs)) {
-      const owner = this.findPerformerByIdentity(pluginId, externalId);
-      if (!owner || owner.id === performerId) identity.run(performerId, pluginId, externalId);
-    }
+    for (const { pluginId, externalId } of identities) identity.run(performerId, pluginId, externalId);
     return this.getPerformer(performerId);
+  }
+
+  performerIdentities(performerId: string): Array<{ pluginId: string; externalId: string }> {
+    return this.sqlite.prepare("SELECT plugin_id AS pluginId, external_id AS externalId FROM performer_identities WHERE performer_id=? ORDER BY plugin_id,external_id").all(performerId) as Array<{ pluginId: string; externalId: string }>;
   }
 
   setPerformerPriority(performerId: string, priority: number): Performer | undefined {

@@ -87,7 +87,7 @@ export function PlayerViewer({ media, context, autoStart = false, close, favorit
   const toggleAutoplay = () => { const value = !autoplay; setAutoplay(value); localStorage.setItem("open-easyx.autoplay", String(value)); };
   const next = async () => {
     await save(true, true);
-    if (!autoplay) return;
+    if (!autoplay || deleting) return;
     let ids = context.ids ?? [];
     if (context.query) ids = (await api<{ ids: string[] }>(`/api/library/playlist?${context.query}`).catch(() => ({ ids }))).ids;
     const nextId = nextMediaId(ids, media.id);
@@ -112,13 +112,13 @@ export function PlayerViewer({ media, context, autoStart = false, close, favorit
   useEffect(() => {
     if (media.kind !== "image") return;
     setPhotoRemaining(PHOTO_AUTOPLAY_SECONDS);
-    if (!autoplay || !photoReady) return;
+    if (!autoplay || !photoReady || deleting) return;
     const startedAt = Date.now();
     const updateCountdown = () => setPhotoRemaining(Math.max(0, Math.ceil(PHOTO_AUTOPLAY_SECONDS - (Date.now() - startedAt) / 1000)));
     const interval = window.setInterval(updateCountdown, 250);
     const timer = window.setTimeout(() => { void next(); }, PHOTO_AUTOPLAY_SECONDS * 1000);
     return () => { window.clearInterval(interval); window.clearTimeout(timer); };
-  }, [media.id, media.kind, autoplay, photoReady]);
+  }, [media.id, media.kind, autoplay, photoReady, deleting]);
   useEffect(() => {
     if (media.kind !== "video") return;
     let cancelled = false;

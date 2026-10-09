@@ -357,7 +357,13 @@ function Library({ preset = {}, favoriteOnly = false, historyOnly = false, open,
   const toggleSelected = (id: string) => setSelectedIds((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   const selectPage = () => setSelectedIds((current) => result?.items.every((item) => current.has(item.id)) ? new Set() : new Set(result?.items.map((item) => item.id) ?? []));
   const cancelSelection = () => { setSelectionMode(false); setSelectedIds(new Set()); };
-  const dropFromResult = (removed: Set<string>) => setResult((current) => current && ({ ...current, items: current.items.filter((item) => !removed.has(item.id)), total: Math.max(0, current.total - removed.size), pages: Math.max(1, Math.ceil((current.total - removed.size) / current.pageSize)) }));
+  const dropFromResult = (removed: Set<string>) => {
+    if (!result) return;
+    const total = Math.max(0, result.total - removed.size); const pages = Math.max(1, Math.ceil(total / result.pageSize));
+    setResult({ ...result, items: result.items.filter((item) => !removed.has(item.id)), total, pages });
+    setSelectedIds((current) => new Set([...current].filter((id) => !removed.has(id))));
+    if (page > pages) setPage(pages);
+  };
   const deleteOne = async (media: Media) => {
     if (deleting || !window.confirm(`Permanently delete "${media.title}"? This cannot be undone.`)) return;
     setDeleting(true);
