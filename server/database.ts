@@ -710,6 +710,16 @@ export class Database {
     return row ? this.mapItem(row) : undefined;
   }
 
+  /** Live recordings that were running or being stopped when the application went down. */
+  interruptedLiveItems(): DownloadItem[] {
+    return (this.sqlite.prepare("SELECT * FROM items WHERE status IN ('downloading','stopping') AND json_extract(metadata_json,'$.live')=1 ORDER BY created_at").all() as any[]).map((row) => this.mapItem(row));
+  }
+
+  /** Lift the "stopped or cancelled while live" block for a source, as if the room had been seen offline. */
+  resumeLiveRecordings(sourceId: string) {
+    return Number(this.sqlite.prepare("UPDATE live_recording_state SET suppressed=0,offline=1,retries=0 WHERE source_id=?").run(sourceId).changes);
+  }
+
   requeueInterruptedDownloads() {
     const stamp = now();
     const queued = this.sqlite.prepare("UPDATE items SET status='queued',progress=0,downloaded_bytes=0,error=NULL,download_started_at=NULL,download_finished_at=NULL,updated_at=? WHERE status='downloading'").run(stamp);

@@ -654,7 +654,9 @@ function startEmbeddedSubtitleWorker() {
 }
 
 const shutdown = async () => {
-  shuttingDown = true; queue.stop(); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
+  // A second signal while live recordings are being saved exits at once; they are recovered on the next start.
+  if (shuttingDown) process.exit(0);
+  shuttingDown = true; await queue.shutdown(); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
   await browserLogin.stop(); await app.close(); libraryDb.close(); db.close(); process.exit(0);
 };
 process.on("SIGTERM", shutdown); process.on("SIGINT", shutdown);
