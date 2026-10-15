@@ -116,14 +116,7 @@ async function stripchatApi(context: PluginContext, account: StripchatAccount, m
 
 async function stripchatFavoriteIds(context: PluginContext, account: StripchatAccount): Promise<number[]> {
   const payload = await stripchatApi(context, account, "GET", `/users/${account.userId}/favorites`);
-  const rawIds = record(payload)?.modelIds;
-  if (!Array.isArray(rawIds)) throw new Error("Stripchat returned an invalid followed ID list");
-  const ids = rawIds.map(Number);
-  if (ids.some((id) => !Number.isInteger(id) || id <= 0)) throw new Error("Stripchat returned an invalid followed model ID");
-  const unique = [...new Set(ids)];
-  if (unique.length !== ids.length) throw new Error("Stripchat returned duplicate followed model IDs");
-  if (unique.length > MAX_FAVORITES) throw new Error("The Stripchat followed list exceeded its safety limit");
-  return unique;
+  return followedIdList(record(payload)?.modelIds);
 }
 
 async function favoriteSnapshot(context: PluginContext, account: StripchatAccount): Promise<LiveCamFavoriteSnapshot> {
@@ -139,14 +132,50 @@ async function favoriteSnapshot(context: PluginContext, account: StripchatAccoun
   return { cams: [...unique.values()], authoritative: true };
 }
 
+/** Validated followed IDs; throws on anything that is not a complete, plausible list. */
+function followedIdList(rawIds: unknown): number[] {
+  if (!Array.isArray(rawIds)) throw new Error("Stripchat returned an invalid followed ID list");
+  const ids = rawIds.map(Number);
+  if (ids.some((id) => !Number.isInteger(id) || id <= 0)) throw new Error("Stripchat returned an invalid followed model ID");
+  const unique = [...new Set(ids)];
+  if (unique.length !== ids.length) throw new Error("Stripchat returned duplicate followed model IDs");
+  if (unique.length > MAX_FAVORITES) throw new Error("The Stripchat followed list exceeded its safety limit");
+  return unique;
+}
+
+/**
+ * Stripchat refuses direct API requests from servers more and more often (HTTP 403
+ * or 418). The browser helper then reads the same followed list from inside a real
+ * Stripchat page, signed in with the imported session.
+ */
+async function browserFavoriteSnapshot(context: PluginContext): Promise<LiveCamFavoriteSnapshot> {
+  const cookiesFile = typeof context.config.cookiesFile === "string" ? context.config.cookiesFile.trim() : "";
+  if (!cookiesFile) throw new Error("The Stripchat browser session is unavailable");
+  const result = await context.runCommand("easyx-browser-fetch", ["--stripchat-favorites", cookiesFile], { timeoutMs: 90_000, maxOutputBytes: 32 * 1024 * 1024 });
+  if (result.exitCode !== 0) throw new Error(result.stderr.replace(/^Browser-compatible request failed:\s*/i, "").trim() || "Stripchat favorites could not be read in the browser");
+  let payload: unknown;
+  try { payload = JSON.parse(result.stdout); } catch { throw new Error("Stripchat returned an invalid favorites response"); }
+  const value = record(payload);
+  followedIdList(value?.modelIds);
+  if (!Array.isArray(value?.models)) throw new Error("Stripchat returned no followed model details");
+  const unique = new Map<string, LiveCam & { online: boolean }>();
+  for (const cam of stripchatFavoriteCams({ models: value.models })) unique.set(cam.username.toLowerCase(), cam);
+  // Same trust as the direct API: every chunk was answered, so the list is complete.
+  return { cams: [...unique.values()], authoritative: true };
+}
+
 export async function stripchatFollowedSnapshot(context: PluginContext): Promise<LiveCamFavoriteSnapshot> {
-  let account: StripchatAccount | undefined;
-  try { account = await stripchatAccount(context); }
-  catch (error) { return { cams: [], authoritative: false, skippedReason: error instanceof Error ? error.message : String(error) }; }
-  if (!account) return { cams: [], authoritative: false, skippedReason: "Connect a Stripchat account to synchronize followed creators." };
-  try { return await favoriteSnapshot(context, account); }
+  let directProblem: string;
+  try {
+    const account = await stripchatAccount(context);
+    if (!account) return { cams: [], authoritative: false, skippedReason: "Connect a Stripchat account to synchronize followed creators." };
+    return await favoriteSnapshot(context, account);
+  } catch (error) { directProblem = error instanceof Error ? error.message : String(error); }
+  context.log("debug", "Stripchat favorites API refused the direct request; trying the browser session", { reason: directProblem });
+  try { return await browserFavoriteSnapshot(context); }
   catch (error) {
-    const skippedReason = error instanceof Error ? error.message : String(error);
+    const browserProblem = error instanceof Error ? error.message : String(error);
+    const skippedReason = browserProblem === "The Stripchat browser session is unavailable" ? directProblem : `${directProblem} (browser: ${browserProblem})`;
     context.log("warn", "Stripchat favorite synchronization skipped", { reason: skippedReason });
     return { cams: [], authoritative: false, skippedReason };
   }

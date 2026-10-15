@@ -142,6 +142,43 @@ describe("Stripchat account favorites", () => {
     expect(fetch.mock.calls[3][0].toString()).toContain("/api/front/models/list?modelIds=11%2C12");
   });
 
+  it("reads the followed list through the browser session when Stripchat refuses the direct API", async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(modernAccountPage()))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ initialDynamic: { user: { id: 77, username: "viewer" } } })))
+      .mockResolvedValueOnce(new Response("", { status: 418 }));
+    const cookiesFile = stripchatSession();
+    const runCommand = vi.fn(async () => ({ exitCode: 0, stderr: "", stdout: JSON.stringify({ loggedIn: true, userId: 77, modelIds: [11, 12], models: [
+      { id: 11, username: "Alice", status: "public", viewersCount: 42 },
+      { id: 12, username: "Bob", status: "offline" },
+    ] }) }));
+    const mock = { config: { cookiesFile }, fetch, log: vi.fn(), runCommand } as unknown as PluginContext;
+
+    await expect(stripchatFollowedSnapshot(mock)).resolves.toEqual({
+      authoritative: true,
+      cams: [expect.objectContaining({ username: "Alice", online: true }), expect.objectContaining({ username: "Bob", online: false })],
+    });
+    expect(runCommand).toHaveBeenCalledWith("easyx-browser-fetch", ["--stripchat-favorites", cookiesFile], expect.any(Object));
+  });
+
+  it("keeps local favorites and reports both problems when the browser session also fails", async () => {
+    const fetch = vi.fn(async () => new Response("", { status: 403 }));
+    const runCommand = vi.fn(async () => ({ exitCode: 1, stdout: "", stderr: "Browser-compatible request failed: The Stripchat session is not signed in. Reconnect the account." }));
+    const mock = { config: { cookiesFile: stripchatSession() }, fetch, log: vi.fn(), runCommand } as unknown as PluginContext;
+
+    const snapshot = await stripchatFollowedSnapshot(mock);
+    expect(snapshot).toMatchObject({ authoritative: false, cams: [] });
+    expect(snapshot.skippedReason).toContain("HTTP 403");
+    expect(snapshot.skippedReason).toContain("not signed in");
+  });
+
+  it("never treats a malformed browser answer as an empty followed list", async () => {
+    const fetch = vi.fn(async () => new Response("", { status: 403 }));
+    const runCommand = vi.fn(async () => ({ exitCode: 0, stderr: "", stdout: JSON.stringify({ loggedIn: true, userId: 77, models: [] }) }));
+    const mock = { config: { cookiesFile: stripchatSession() }, fetch, log: vi.fn(), runCommand } as unknown as PluginContext;
+    await expect(stripchatFollowedSnapshot(mock)).resolves.toMatchObject({ authoritative: false, cams: [] });
+  });
+
   it("mirrors a follow to Stripchat and verifies it in the remote favorite lists", async () => {
     const fetch = vi.fn()
       .mockResolvedValueOnce(new Response(accountPage()))
