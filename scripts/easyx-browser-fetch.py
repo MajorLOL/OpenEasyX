@@ -456,15 +456,137 @@ def stripchat_favorite(url: str, cookies_file: str, model_id: int, follow: bool)
                 process.wait(timeout=5)
 
 
+STRIPCHAT_FAVORITES_SCRIPT = r"""(async () => {
+  const state = (() => { try { return (window.getState && window.getState()) || window.__PRELOADED_STATE__ || null; } catch { return window.__PRELOADED_STATE__ || null; } })();
+  const userId = Number(state?.userSession?.currentUser?.id || 0);
+  if (!userId) return { ready: Boolean(state), loggedIn: false };
+  const frontVersion = String(state?.config?.releaseVersion || state?.configV3?.releaseVersion || "");
+  const headers = { accept: "application/json", ...(frontVersion ? { "front-version": frontVersion } : {}) };
+  const get = async (path) => {
+    const response = await fetch(path, { credentials: "include", headers });
+    if (!response.ok) throw new Error(`HTTP ${response.status} for ${path.split("?")[0]}`);
+    return response.json();
+  };
+  const favorites = await get(`/api/front/users/${userId}/favorites`);
+  const modelIds = Array.isArray(favorites?.modelIds) ? favorites.modelIds.map(Number) : null;
+  if (!modelIds) throw new Error("Stripchat returned no followed ID list");
+  const models = [];
+  for (let offset = 0; offset < modelIds.length; offset += 100) {
+    const chunk = modelIds.slice(offset, offset + 100);
+    const page = await get(`/api/front/models/list?modelIds=${encodeURIComponent(chunk.join(","))}`);
+    if (Array.isArray(page?.models)) models.push(...page.models);
+  }
+  return { ready: true, loggedIn: true, userId, modelIds, models };
+})()"""
+
+
+async def _stripchat_favorites_cdp(websocket_url: str, cookies: list[dict[str, object]]) -> dict[str, object]:
+    """Read the signed-in account's followed models from inside a real Stripchat page.
+
+    The site refuses direct API requests from servers (HTTP 403/418), but its own
+    page may call the same endpoints with the browser session.
+    """
+    message_id = 0
+    async with connect(websocket_url, origin=None, max_size=64 * 1024 * 1024) as websocket:
+        pending: dict[int, asyncio.Future] = {}
+
+        async def receive_messages() -> None:
+            while True:
+                message = json.loads(await websocket.recv())
+                response_id = message.get("id")
+                if isinstance(response_id, int) and response_id in pending:
+                    future = pending.pop(response_id)
+                    if not future.done():
+                        future.set_result(message)
+
+        async def command(method: str, params: dict[str, object] | None = None, timeout: float = 15) -> dict[str, object]:
+            nonlocal message_id
+            message_id += 1
+            future = asyncio.get_running_loop().create_future()
+            pending[message_id] = future
+            await websocket.send(json.dumps({"id": message_id, "method": method, "params": params or {}}))
+            try:
+                return await asyncio.wait_for(future, timeout=timeout)
+            finally:
+                pending.pop(message_id, None)
+
+        receiver = asyncio.create_task(receive_messages())
+        try:
+            await command("Network.enable")
+            await command("Network.setCookies", {"cookies": cookies})
+            await command("Page.enable")
+            await command("Page.navigate", {"url": os.environ.get("EASYX_STRIPCHAT_FAVORITES_URL", "https://stripchat.com/favorites")})
+            last: dict[str, object] = {}
+            deadline = time.monotonic() + 40
+            while time.monotonic() < deadline:
+                response = await command("Runtime.evaluate", {"expression": STRIPCHAT_FAVORITES_SCRIPT, "returnByValue": True, "awaitPromise": True}, timeout=45)
+                result = ((response.get("result") or {}).get("result") or {})
+                if result.get("subtype") == "error":
+                    raise RuntimeError(str(result.get("description") or "Stripchat favorites could not be read").splitlines()[0])
+                last = result.get("value") if isinstance(result.get("value"), dict) else {}
+                if last.get("loggedIn"):
+                    return last
+                await asyncio.sleep(1)
+            if last.get("ready"):
+                raise RuntimeError("The Stripchat session is not signed in. Reconnect the account.")
+            raise RuntimeError("The Stripchat favorites page did not load")
+        finally:
+            receiver.cancel()
+            try:
+                await receiver
+            except asyncio.CancelledError:
+                pass
+
+
+def stripchat_favorites(cookies_file: str) -> str:
+    executable = next((value for value in (shutil.which("chromium"), shutil.which("chromium-browser"), shutil.which("google-chrome")) if value), None)
+    if not executable:
+        raise RuntimeError("Chromium is not installed")
+    cookies = _netscape_cookies(cookies_file)
+    if not cookies:
+        raise RuntimeError("The Stripchat session file contains no cookies")
+    port = _free_port()
+    with tempfile.TemporaryDirectory(prefix="easyx-stripchat-favorites-", ignore_cleanup_errors=True) as profile:
+        process = subprocess.Popen([
+            executable, "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--remote-allow-origins=*", f"--remote-debugging-port={port}", f"--user-data-dir={profile}", "about:blank",
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, "LANG": "en_US.UTF-8"})
+        try:
+            page = None
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                try:
+                    pages = requests.get(f"http://127.0.0.1:{port}/json/list", timeout=1).json()
+                    page = next((item for item in pages if item.get("type") == "page"), None)
+                    if page:
+                        break
+                except Exception:
+                    time.sleep(0.1)
+            if not page or not page.get("webSocketDebuggerUrl"):
+                raise RuntimeError("Chromium debugging page did not start")
+            return json.dumps(asyncio.run(_stripchat_favorites_cdp(page["webSocketDebuggerUrl"], cookies)), ensure_ascii=False)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+
 def main() -> int:
     render = len(sys.argv) == 3 and sys.argv[1] == "--render"
     mfc_models = len(sys.argv) in (3, 4) and sys.argv[1] == "--mfc-models"
     capture_media = len(sys.argv) in (3, 4) and sys.argv[1] == "--capture-media"
     stripchat_favorite_action = len(sys.argv) == 6 and sys.argv[1] == "--stripchat-favorite"
-    if not render and not mfc_models and not capture_media and not stripchat_favorite_action and len(sys.argv) != 2:
-        print("usage: easyx-browser-fetch [--render|--capture-media] URL | --mfc-models PAGE [SEARCH] | --stripchat-favorite URL COOKIES MODEL_ID follow|unfollow", file=sys.stderr)
+    stripchat_favorites_list = len(sys.argv) == 3 and sys.argv[1] == "--stripchat-favorites"
+    if not render and not mfc_models and not capture_media and not stripchat_favorite_action and not stripchat_favorites_list and len(sys.argv) != 2:
+        print("usage: easyx-browser-fetch [--render|--capture-media] URL | --mfc-models PAGE [SEARCH] | --stripchat-favorite URL COOKIES MODEL_ID follow|unfollow | --stripchat-favorites COOKIES", file=sys.stderr)
         return 2
     try:
+        if stripchat_favorites_list:
+            sys.stdout.write(stripchat_favorites(sys.argv[2]))
+            return 0
         if stripchat_favorite_action:
             if sys.argv[5] not in {"follow", "unfollow"}:
                 raise RuntimeError("Stripchat favorite action must be follow or unfollow")
