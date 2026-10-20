@@ -16,5 +16,5 @@ export function SourceHardRefresh({ sourceId, domain, run }: { sourceId: string;
       } finally { setPending(false); }
     }, `${domain} hard refresh completed`);
   };
-  return <span className="source-hard-refresh"><button type="button" className="icon-button" disabled={pending} aria-label={`Hard refresh ${domain}`} title={pending ? "Rescanning source…" : "Hard refresh: reconsider deleted and missing content"} onClick={refresh}><RotateCcw size={14}/></button>{result && <small role="status">{result}</small>}</span>;
+  return <span className="source-hard-refresh"><button type="button" className="icon-button" disabled={pending} aria-label={`Hard refresh ${domain}`} title={pending ? "Rescanning source…" : "Hard refresh: reconsider deleted and missing content, and record a cancelled live room again"} onClick={refresh}><RotateCcw size={14}/></button>{result && <small role="status">{result}</small>}</span>;
 }

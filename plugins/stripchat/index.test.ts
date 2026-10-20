@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "../../packages/plugin-sdk/index.js";
-import { listStripchatMedia, resolveStripchatDirect, resolveStripchatDownload, setStripchatFavorite, stripchatFollowedSnapshot, stripchatPublicPlaybackKey } from "./index.js";
+import { listStripchatMedia, resolveStripchatDirect, resolveStripchatDownload, setStripchatFavorite, stripchatFollowedSnapshot, stripchatPublicPlaybackKey, stripchatVariantUrls } from "./index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -142,6 +142,43 @@ describe("Stripchat account favorites", () => {
     expect(fetch.mock.calls[3][0].toString()).toContain("/api/front/models/list?modelIds=11%2C12");
   });
 
+  it("reads the followed list through the browser session when Stripchat refuses the direct API", async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(modernAccountPage()))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ initialDynamic: { user: { id: 77, username: "viewer" } } })))
+      .mockResolvedValueOnce(new Response("", { status: 418 }));
+    const cookiesFile = stripchatSession();
+    const runCommand = vi.fn(async () => ({ exitCode: 0, stderr: "", stdout: JSON.stringify({ loggedIn: true, userId: 77, modelIds: [11, 12], models: [
+      { id: 11, username: "Alice", status: "public", viewersCount: 42 },
+      { id: 12, username: "Bob", status: "offline" },
+    ] }) }));
+    const mock = { config: { cookiesFile }, fetch, log: vi.fn(), runCommand } as unknown as PluginContext;
+
+    await expect(stripchatFollowedSnapshot(mock)).resolves.toEqual({
+      authoritative: true,
+      cams: [expect.objectContaining({ username: "Alice", online: true }), expect.objectContaining({ username: "Bob", online: false })],
+    });
+    expect(runCommand).toHaveBeenCalledWith("easyx-browser-fetch", ["--stripchat-favorites", cookiesFile], expect.any(Object));
+  });
+
+  it("keeps local favorites and reports both problems when the browser session also fails", async () => {
+    const fetch = vi.fn(async () => new Response("", { status: 403 }));
+    const runCommand = vi.fn(async () => ({ exitCode: 1, stdout: "", stderr: "Browser-compatible request failed: The Stripchat session is not signed in. Reconnect the account." }));
+    const mock = { config: { cookiesFile: stripchatSession() }, fetch, log: vi.fn(), runCommand } as unknown as PluginContext;
+
+    const snapshot = await stripchatFollowedSnapshot(mock);
+    expect(snapshot).toMatchObject({ authoritative: false, cams: [] });
+    expect(snapshot.skippedReason).toContain("HTTP 403");
+    expect(snapshot.skippedReason).toContain("not signed in");
+  });
+
+  it("never treats a malformed browser answer as an empty followed list", async () => {
+    const fetch = vi.fn(async () => new Response("", { status: 403 }));
+    const runCommand = vi.fn(async () => ({ exitCode: 0, stderr: "", stdout: JSON.stringify({ loggedIn: true, userId: 77, models: [] }) }));
+    const mock = { config: { cookiesFile: stripchatSession() }, fetch, log: vi.fn(), runCommand } as unknown as PluginContext;
+    await expect(stripchatFollowedSnapshot(mock)).resolves.toMatchObject({ authoritative: false, cams: [] });
+  });
+
   it("mirrors a follow to Stripchat and verifies it in the remote favorite lists", async () => {
     const fetch = vi.fn()
       .mockResolvedValueOnce(new Response(accountPage()))
@@ -188,5 +225,33 @@ describe("Stripchat account favorites", () => {
     }, true)).resolves.toEqual({ synchronized: true });
     expect(runCommand).not.toHaveBeenCalled();
     expect(fetch).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("Stripchat recording quality", () => {
+  const master = [
+    "#EXTM3U",
+    '#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,NAME="1080p"', "https://media-hls.doppiocdn.media/live/42.m3u8",
+    '#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,NAME="720p"', "https://media-hls.doppiocdn.media/live/42_720p.m3u8",
+    '#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=854x480,NAME="480p"', "https://media-hls.doppiocdn.media/live/42_480p.m3u8",
+  ].join("\n");
+
+  it("keeps the manifest order (highest first) when set to automatic", () => {
+    expect(stripchatVariantUrls(master, "https://edge-hls.doppiocdn.media/hls/42/master/42_auto.m3u8")).toEqual([
+      "https://media-hls.doppiocdn.media/live/42.m3u8", "https://media-hls.doppiocdn.media/live/42_720p.m3u8", "https://media-hls.doppiocdn.media/live/42_480p.m3u8",
+    ]);
+  });
+
+  it("records the performer's chosen maximum quality", async () => {
+    const live = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:123\n#EXTINF:2\nsegment.mp4\n";
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/v2.12.0/main.js")) return new Response('function airplay(url){url.searchParams.set("pkey","PublicKey123456")}');
+      return new Response(url.includes("/master/") ? master : live);
+    });
+    const mock = { config: { recordingMaxHeight: 480 }, fetch, log: vi.fn(), runCommand: vi.fn(async () => ({ exitCode: 0, stdout: pageState(), stderr: "" })) };
+    const request = await resolveStripchatDownload(mock, { externalId: "stripchat:alice:session", pageUrl: "https://stripchat.com/Alice", mediaType: "video" });
+    if (request.kind !== "command") throw new Error("Expected the live recorder");
+    expect(request.args[2]).toBe("https://media-hls.doppiocdn.media/live/42_480p.m3u8?pkey=PublicKey123456");
   });
 });

@@ -26,6 +26,9 @@ export class SourceSync {
       if (!current || current.profileUrl !== source.profileUrl || current.scraperPluginId !== source.scraperPluginId) {
         throw Object.assign(new Error("Source changed during the scan; run it again"), { statusCode: 409 });
       }
+      // A hard refresh is an explicit request to reconsider everything, including a
+      // live room whose recording was stopped or cancelled while it stayed online.
+      if (hardRefresh) this.db.resumeLiveRecordings(sourceId);
       const scanCandidates = this.db.liveScanCandidates(current, candidates);
       const dates: string[] = [];
       const result = hardRefresh

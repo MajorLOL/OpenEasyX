@@ -541,6 +541,7 @@ app.patch<{ Params: { id: string }; Body: unknown }>("/api/sources/:id", async (
     scraperPluginId: z.union([z.string().min(1), z.null()]).optional(), scrapeEnabled: z.boolean().optional(),
     pluginId: z.string().min(1).optional(), label: z.string().trim().min(1).max(160).optional(), profileUrl: z.string().url().optional(), enabled: z.boolean().optional(),
     autoDownload: z.boolean().optional(), syncIntervalSeconds: z.number().int().min(5).max(31_536_000).optional(), syncIntervalMinutes: z.number().int().min(1).max(525600).optional(),
+    recordingMaxHeight: z.number().int().min(0).max(4320).optional(),
   }).parse(request.body);
   const current = db.getSource(request.params.id);
   if (!current) throw Object.assign(new Error("Source not found"), { statusCode: 404 });
@@ -653,7 +654,9 @@ function startEmbeddedSubtitleWorker() {
 }
 
 const shutdown = async () => {
-  shuttingDown = true; queue.stop(); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
+  // A second signal while live recordings are being saved exits at once; they are recovered on the next start.
+  if (shuttingDown) process.exit(0);
+  shuttingDown = true; await queue.shutdown(); if (subtitleWorkerRestart) clearTimeout(subtitleWorkerRestart); subtitleWorker?.kill("SIGTERM");
   await browserLogin.stop(); await app.close(); libraryDb.close(); db.close(); process.exit(0);
 };
 process.on("SIGTERM", shutdown); process.on("SIGINT", shutdown);

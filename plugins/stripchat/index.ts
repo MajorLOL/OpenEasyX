@@ -1,4 +1,5 @@
 import { LIVE_RECORDER_SCRIPT, retryDelay } from "../live-recorder.js";
+import { orderVariantsForRecording, parseHlsVariants, recordingMaxHeight } from "../hls-quality.js";
 import { createLiveCamPlugin } from "../live-cam-plugin-factory.js";
 import { accountSignal, cookieHeader, readAccountCookies } from "../account-cookies.js";
 import { browserHtml } from "../browser-html-utils.js";
@@ -115,14 +116,7 @@ async function stripchatApi(context: PluginContext, account: StripchatAccount, m
 
 async function stripchatFavoriteIds(context: PluginContext, account: StripchatAccount): Promise<number[]> {
   const payload = await stripchatApi(context, account, "GET", `/users/${account.userId}/favorites`);
-  const rawIds = record(payload)?.modelIds;
-  if (!Array.isArray(rawIds)) throw new Error("Stripchat returned an invalid followed ID list");
-  const ids = rawIds.map(Number);
-  if (ids.some((id) => !Number.isInteger(id) || id <= 0)) throw new Error("Stripchat returned an invalid followed model ID");
-  const unique = [...new Set(ids)];
-  if (unique.length !== ids.length) throw new Error("Stripchat returned duplicate followed model IDs");
-  if (unique.length > MAX_FAVORITES) throw new Error("The Stripchat followed list exceeded its safety limit");
-  return unique;
+  return followedIdList(record(payload)?.modelIds);
 }
 
 async function favoriteSnapshot(context: PluginContext, account: StripchatAccount): Promise<LiveCamFavoriteSnapshot> {
@@ -138,14 +132,50 @@ async function favoriteSnapshot(context: PluginContext, account: StripchatAccoun
   return { cams: [...unique.values()], authoritative: true };
 }
 
+/** Validated followed IDs; throws on anything that is not a complete, plausible list. */
+function followedIdList(rawIds: unknown): number[] {
+  if (!Array.isArray(rawIds)) throw new Error("Stripchat returned an invalid followed ID list");
+  const ids = rawIds.map(Number);
+  if (ids.some((id) => !Number.isInteger(id) || id <= 0)) throw new Error("Stripchat returned an invalid followed model ID");
+  const unique = [...new Set(ids)];
+  if (unique.length !== ids.length) throw new Error("Stripchat returned duplicate followed model IDs");
+  if (unique.length > MAX_FAVORITES) throw new Error("The Stripchat followed list exceeded its safety limit");
+  return unique;
+}
+
+/**
+ * Stripchat refuses direct API requests from servers more and more often (HTTP 403
+ * or 418). The browser helper then reads the same followed list from inside a real
+ * Stripchat page, signed in with the imported session.
+ */
+async function browserFavoriteSnapshot(context: PluginContext): Promise<LiveCamFavoriteSnapshot> {
+  const cookiesFile = typeof context.config.cookiesFile === "string" ? context.config.cookiesFile.trim() : "";
+  if (!cookiesFile) throw new Error("The Stripchat browser session is unavailable");
+  const result = await context.runCommand("easyx-browser-fetch", ["--stripchat-favorites", cookiesFile], { timeoutMs: 90_000, maxOutputBytes: 32 * 1024 * 1024 });
+  if (result.exitCode !== 0) throw new Error(result.stderr.replace(/^Browser-compatible request failed:\s*/i, "").trim() || "Stripchat favorites could not be read in the browser");
+  let payload: unknown;
+  try { payload = JSON.parse(result.stdout); } catch { throw new Error("Stripchat returned an invalid favorites response"); }
+  const value = record(payload);
+  followedIdList(value?.modelIds);
+  if (!Array.isArray(value?.models)) throw new Error("Stripchat returned no followed model details");
+  const unique = new Map<string, LiveCam & { online: boolean }>();
+  for (const cam of stripchatFavoriteCams({ models: value.models })) unique.set(cam.username.toLowerCase(), cam);
+  // Same trust as the direct API: every chunk was answered, so the list is complete.
+  return { cams: [...unique.values()], authoritative: true };
+}
+
 export async function stripchatFollowedSnapshot(context: PluginContext): Promise<LiveCamFavoriteSnapshot> {
-  let account: StripchatAccount | undefined;
-  try { account = await stripchatAccount(context); }
-  catch (error) { return { cams: [], authoritative: false, skippedReason: error instanceof Error ? error.message : String(error) }; }
-  if (!account) return { cams: [], authoritative: false, skippedReason: "Connect a Stripchat account to synchronize followed creators." };
-  try { return await favoriteSnapshot(context, account); }
+  let directProblem: string;
+  try {
+    const account = await stripchatAccount(context);
+    if (!account) return { cams: [], authoritative: false, skippedReason: "Connect a Stripchat account to synchronize followed creators." };
+    return await favoriteSnapshot(context, account);
+  } catch (error) { directProblem = error instanceof Error ? error.message : String(error); }
+  context.log("debug", "Stripchat favorites API refused the direct request; trying the browser session", { reason: directProblem });
+  try { return await browserFavoriteSnapshot(context); }
   catch (error) {
-    const skippedReason = error instanceof Error ? error.message : String(error);
+    const browserProblem = error instanceof Error ? error.message : String(error);
+    const skippedReason = browserProblem === "The Stripchat browser session is unavailable" ? directProblem : `${directProblem} (browser: ${browserProblem})`;
     context.log("warn", "Stripchat favorite synchronization skipped", { reason: skippedReason });
     return { cams: [], authoritative: false, skippedReason };
   }
@@ -216,14 +246,10 @@ export function stripchatPublicPlaybackKey(playerSource: string): string | undef
   return playerSource.match(PLAYBACK_KEY_PATTERN)?.[1];
 }
 
-function playlistUrls(manifest: string, baseUrl: string): string[] {
-  const urls: string[] = [];
-  for (const line of manifest.split(/\r?\n/)) {
-    const value = line.trim();
-    if (!value || value.startsWith("#") || !/\.m3u8(?:$|\?)/i.test(value)) continue;
-    try { urls.push(new URL(value, baseUrl).toString()); } catch { /* Ignore malformed variants. */ }
-  }
-  return urls;
+/** Variant URLs in recording preference order: manifest order (highest first) or the best at or below maxHeight. */
+export function stripchatVariantUrls(manifest: string, baseUrl: string, maxHeight = 0): string[] {
+  const variants = parseHlsVariants(manifest, baseUrl);
+  return (maxHeight ? orderVariantsForRecording(variants, maxHeight) : variants).map((variant) => variant.url);
 }
 
 function isLivePlaylist(manifest: string): boolean {
@@ -242,6 +268,7 @@ async function resolveStripchatHls(context: PluginContext, pageUrl: string): Pro
   const playerResponse = await context.fetch(stream.playerScriptUrl, { headers, signal: context.signal ?? AbortSignal.timeout(15_000) });
   if (!playerResponse.ok) throw new Error(`Stripchat player module returned HTTP ${playerResponse.status}`);
   const playbackKey = stripchatPublicPlaybackKey(await playerResponse.text());
+  const maxHeight = recordingMaxHeight(context.config);
   if (!playbackKey) throw new Error("Stripchat player module did not expose a public playback key");
 
   for (const domain of stream.domains) {
@@ -252,7 +279,7 @@ async function resolveStripchatHls(context: PluginContext, pageUrl: string): Pro
       if (!response.ok) continue;
       const manifest = await response.text();
       if (!manifest.trimStart().startsWith("#EXTM3U") || manifest.includes("#EXT-X-MOUFLON-ADVERT")) continue;
-      for (const candidate of playlistUrls(manifest, master.toString())) {
+      for (const candidate of stripchatVariantUrls(manifest, master.toString(), maxHeight)) {
         const variant = new URL(candidate);
         if (!variant.searchParams.has("pkey")) variant.searchParams.set("pkey", playbackKey);
         const variantResponse = await context.fetch(variant, { headers, signal: context.signal ?? AbortSignal.timeout(15_000) });

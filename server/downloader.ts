@@ -13,15 +13,34 @@ import { filenameFromUrl, safeSegment } from "./utils.js";
 import { downloadOutputPath, recordingEncodingArgs } from "./output-settings.js";
 import { outputSettings } from "../packages/output-settings.js";
 import { canMatchVideoExcerpt, fingerprintVideo, verifyVideoContainment, videoFileStamp, type VideoFingerprint } from "./video-matching.js";
+import type { Source } from "./database.js";
+
+/**
+ * Plugin config for one download, with the source's recording quality applied. A
+ * source set to automatic (0) keeps the plugin's own setting (normally highest).
+ */
+export function recordingConfig(config: Record<string, unknown>, source: Pick<Source, "recordingMaxHeight">): Record<string, unknown> {
+  return source.recordingMaxHeight > 0 ? { ...config, recordingMaxHeight: source.recordingMaxHeight } : config;
+}
 
 type ActiveDownload = {
   /** Live recording of a performer with this priority; preempted when a higher one has to wait for a slot. */
-  live?: boolean; priority?: number; startedAt?: number; preempted?: boolean; child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; matching?: boolean; action?: "stop" | "cancel" | "delete" };
+  live?: boolean; priority?: number; startedAt?: number; preempted?: boolean; child?: ChildProcess; abort?: AbortController; paused: boolean; encoding?: boolean; matching?: boolean; action?: "stop" | "cancel" | "delete";
+  /** Set while the application shuts down: the item is finished or recovered on the next start. */
+  shuttingDown?: boolean; escalation?: NodeJS.Timeout };
+
+/** How long a shutdown waits for live recordings to be saved. Docker's stop_grace_period should be longer. */
+export const SHUTDOWN_GRACE_MS = Math.max(5, Number(process.env.EASYX_SHUTDOWN_GRACE_SECONDS ?? 60) || 60) * 1000;
 
 export class DownloadQueue {
+  /** A cancelled download whose process ignores SIGTERM is killed after this delay. */
+  static cancelKillAfterMs = 10_000;
+  /** A stopped recording that is still finishing gets a second SIGINT (ffmpeg then exits at once). */
+  static stopRepeatAfterMs = 45_000;
   private active = new Map<string, ActiveDownload>();
   private finalizers = new Map<string, Promise<void>>();
   private timer?: NodeJS.Timeout;
+  private stopped = false;
   constructor(
     private db: Database,
     private plugins: PluginManager,
@@ -31,9 +50,23 @@ export class DownloadQueue {
     private onDeleteCompleted?: (item: DownloadItem) => unknown,
   ) {}
 
-  start() {
+  /** Resolves once interrupted recordings are recovered and the queue runs. */
+  start(): Promise<void> {
     fs.mkdirSync(this.mediaRoot, { recursive: true });
     fs.mkdirSync(this.downloadsRoot, { recursive: true, mode: 0o700 });
+    this.stopped = false;
+    const interrupted = this.db.interruptedLiveItems().filter((item) => recordedInput(this.stagingDirectory(item.id)));
+    if (!interrupted.length) { this.run(); return Promise.resolve(); }
+    return this.boot(interrupted);
+  }
+
+  private async boot(interrupted: DownloadItem[]) {
+    try { await this.recoverInterruptedRecordings(interrupted); }
+    catch (error) { this.writeLog?.("error", "download", "Interrupted recordings could not be recovered", { error: error instanceof Error ? error.message : String(error) }); }
+    if (!this.stopped) this.run();
+  }
+
+  private run() {
     this.db.requeueInterruptedDownloads();
     this.timer = setInterval(() => void this.tick(), 1000);
     this.timer.unref();
@@ -41,8 +74,44 @@ export class DownloadQueue {
   }
 
   stop() {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     for (const control of this.active.values()) { this.signal(control, "SIGTERM"); control.abort?.abort(); }
+  }
+
+  /**
+   * Application shutdown. Live recordings are stopped like "Stop and save" and get up
+   * to graceMs to be stored in the library; other downloads are interrupted and start
+   * again on the next run. Whatever is still unfinished when the grace period ends is
+   * recovered from its recorded parts on the next start.
+   */
+  async shutdown(graceMs = SHUTDOWN_GRACE_MS) {
+    this.stopped = true;
+    if (this.timer) clearInterval(this.timer);
+    const live: Array<Promise<void>> = [];
+    for (const [itemId, control] of this.active) {
+      control.shuttingDown = true;
+      if (control.live && (control.encoding || control.matching)) live.push(this.settled(itemId));
+      else if (control.live && !control.action) {
+        control.action = "stop"; control.paused = false;
+        this.signal(control, "SIGCONT"); this.signal(control, "SIGINT");
+        live.push(this.settled(itemId));
+      } else if (!control.live) {
+        this.signal(control, "SIGTERM"); control.abort?.abort();
+      } else live.push(this.settled(itemId));
+    }
+    if (!live.length) return;
+    this.writeLog?.("info", "download", "Saving live recordings before shutdown", { recordings: live.length, graceSeconds: Math.round(graceMs / 1000) });
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([Promise.all(live), new Promise<void>((resolve) => { timer = setTimeout(resolve, graceMs); })]);
+    if (timer) clearTimeout(timer);
+  }
+
+  private settled(itemId: string): Promise<void> {
+    return new Promise((resolve) => {
+      const check = () => this.active.has(itemId) ? setTimeout(check, 100).unref() : resolve();
+      check();
+    });
   }
 
   pause(itemId: string) {
@@ -100,10 +169,32 @@ export class DownloadQueue {
       this.db.suppressLiveRecording(itemId);
       return this.db.setItemStatus(itemId, action === "delete" ? "deleted" : "cancelled");
     }
-    this.db.suppressLiveRecording(itemId);
+    // "Stop and save" keeps the room eligible: a performer who is still online is
+    // recorded again (as a new video) on the next check. Cancel and delete suppress
+    // the room until it is seen offline or the source is hard-refreshed.
+    if (action !== "stop") this.db.suppressLiveRecording(itemId);
     control.action = action; control.paused = false;
     this.signal(control, "SIGCONT"); this.signal(control, action === "stop" ? "SIGINT" : "SIGTERM"); control.abort?.abort();
+    this.escalate(itemId, control);
     return this.db.setItemStatus(itemId, action === "stop" ? "stopping" : "cancelling");
+  }
+
+  /** Make sure a stop or cancel always ends, even when a process ignores the first signal. */
+  private escalate(itemId: string, control: ActiveDownload) {
+    if (control.escalation) clearTimeout(control.escalation);
+    const cancelling = control.action === "cancel" || control.action === "delete";
+    control.escalation = setTimeout(() => {
+      control.escalation = undefined;
+      if (this.active.get(itemId) !== control || !control.child) return;
+      if (cancelling) {
+        this.writeLog?.("warn", "download", "Download did not stop after cancel; killing it", { itemId });
+        this.signal(control, "SIGKILL");
+      } else {
+        this.writeLog?.("warn", "download", "Recording is still finishing after stop; asking it again", { itemId });
+        this.signal(control, "SIGINT");
+      }
+    }, cancelling ? DownloadQueue.cancelKillAfterMs : DownloadQueue.stopRepeatAfterMs);
+    control.escalation.unref();
   }
 
   private async tick() {
@@ -115,7 +206,7 @@ export class DownloadQueue {
       this.active.set(item.id, control);
       const startedItem = this.db.setItemStatus(item.id, "downloading", { progress: 0 })!;
       this.writeLog?.("info", "download", "Download started", { itemId: item.id, pluginId: item.pluginId, title: item.title, mediaType: item.mediaType });
-      void this.download(startedItem, control).finally(() => this.active.delete(item.id));
+      void this.download(startedItem, control).finally(() => { if (control.escalation) clearTimeout(control.escalation); this.active.delete(item.id); });
     }
     if (this.active.size >= max) this.preemptForPriority();
   }
@@ -141,6 +232,7 @@ export class DownloadQueue {
       const [itemId, control] = victim;
       control.preempted = true; control.action = "stop";
       this.signal(control, "SIGCONT"); this.signal(control, "SIGINT"); control.abort?.abort();
+      this.escalate(itemId, control);
       const item = this.db.setItemStatus(itemId, "stopping");
       this.writeLog?.("info", "download", "Recording stopped for a higher-priority performer", { itemId, title: item?.title, priority: control.priority ?? 0, waitingPriority: priority });
     }
@@ -166,7 +258,7 @@ export class DownloadQueue {
       if (!performer || !source) throw new Error("The performer or source no longer exists");
       const settings = outputSettings(this.db.getSettings());
       const resolutionController = new AbortController(); control.abort = resolutionController;
-      const request = await plugin.resolveDownload(this.plugins.context(item.pluginId, resolutionController.signal), {
+      const request = await plugin.resolveDownload(this.plugins.context(item.pluginId, resolutionController.signal, recordingConfig(this.db.getPluginState(item.pluginId).config, source)), {
         externalId: item.externalId, identityKey: item.identityKey, title: item.title, pageUrl: item.pageUrl,
         mediaType: item.mediaType as any, filename: item.filename, qualityScore: item.qualityScore,
         expectedBytes: item.expectedBytes, publishedAt: item.publishedAt, metadata: item.metadata,
@@ -279,6 +371,9 @@ export class DownloadQueue {
         void Promise.resolve(this.onCompleted?.()).catch((error) => this.writeLog?.("warn", "library", "Library refresh after download failed", { error }));
       });
     } catch (error) {
+      // Interrupted by the shutdown: a live recording keeps its parts for recovery on the
+      // next start; any other download stays "downloading" and is queued again.
+      if (control.shuttingDown) { if (control.live) preserveTemporary = true; return; }
       let message = error instanceof Error ? error.message : String(error);
       const parts = temporaryDirectory && path.join(temporaryDirectory, "live-parts");
       if (!["cancel", "delete"].includes(control.action ?? "") && parts && fs.existsSync(parts) && fs.readdirSync(parts).some((file) => file.endsWith(".ts") && fs.statSync(path.join(parts, file)).size > 0)) {
@@ -316,6 +411,64 @@ export class DownloadQueue {
   }
 
   private get downloadsRoot() { return path.join(this.mediaRoot, ".downloads"); }
+
+  /**
+   * A restart (or a container that was killed) used to throw away a running live
+   * recording: the item was queued again and its staging folder wiped. Whatever was
+   * recorded is now turned into a video in the library first; the performer is then
+   * recorded again as a new video if the room is still live.
+   */
+  private stagingDirectory(itemId: string) { return path.join(this.downloadsRoot, safeSegment(itemId, "download")); }
+
+  private async recoverInterruptedRecordings(items: DownloadItem[]) {
+    let recovered = 0;
+    for (const item of items) {
+      if (this.stopped) return;
+      const directory = this.stagingDirectory(item.id);
+      const input = recordedInput(directory);
+      if (!input) continue;
+      const output = path.join(directory, `recovered-${Date.now()}.mp4`);
+      try {
+        if (input.parts) {
+          const list = path.join(directory, "recovered-parts.txt");
+          fs.writeFileSync(list, input.parts.map((part) => `file '${part.replaceAll("'", "'\\''")}'`).join("\n") + "\n");
+          await this.capture("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", list, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", "-y", output], 30 * 60_000);
+        } else {
+          await this.capture("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", input.file!, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", "-y", output], 30 * 60_000);
+        }
+        if (!fs.existsSync(output) || fs.statSync(output).size === 0) throw new Error("FFmpeg produced no video");
+        const performer = this.db.getPerformer(item.performerId); const source = this.db.getSource(item.sourceId);
+        if (!performer || !source) throw new Error("The performer or source no longer exists");
+        const fallback = `${item.externalId}.mp4`;
+        const filename = safeSegment(item.filename ?? fallback, fallback);
+        const destination = path.join(this.mediaRoot, downloadOutputPath(outputSettings(this.db.getSettings()), item, performer.name, source.domain, filename));
+        this.prepareOutputDirectory(path.dirname(destination));
+        const canonicalDate = this.db.setCanonicalMediaDate(item.id, item.publishedAt);
+        await this.applyMediaDate(output, item.mediaType, canonicalDate);
+        const checksum = await this.hashFile(output);
+        const finalPath = this.availableDestination(destination, item.id);
+        fs.renameSync(output, finalPath);
+        const storagePath = path.relative(this.mediaRoot, finalPath);
+        this.db.setItemStatus(item.id, "completed", { progress: 1, checksum, storagePath, error: null });
+        fs.rmSync(directory, { recursive: true, force: true });
+        recovered += 1;
+        this.writeLog?.("info", "download", "Live recording interrupted by a restart was saved", { itemId: item.id, title: item.title, storagePath, parts: input.parts?.length ?? 1 });
+      } catch (error) {
+        fs.rmSync(output, { force: true });
+        let kept = path.relative(this.mediaRoot, directory);
+        try {
+          const recovery = path.join(this.mediaRoot, ".recording-recovery", safeSegment(item.id, "recording"));
+          fs.mkdirSync(path.dirname(recovery), { recursive: true });
+          fs.rmSync(recovery, { recursive: true, force: true });
+          fs.renameSync(directory, recovery); kept = path.relative(this.mediaRoot, recovery);
+        } catch { /* Leave it in staging. */ }
+        const reason = error instanceof Error ? error.message : String(error);
+        this.db.setItemStatus(item.id, "failed", { error: `Recording interrupted by a restart could not be joined (${reason}). The recorded data is kept at ${kept}.` });
+        this.writeLog?.("error", "download", "Interrupted live recording could not be recovered", { itemId: item.id, kept, error: reason });
+      }
+    }
+    if (recovered) void Promise.resolve(this.onCompleted?.()).catch((error) => this.writeLog?.("warn", "library", "Library refresh after recovery failed", { error }));
+  }
 
   private async checkVideoExcerpt(item: DownloadItem, file: string, control: ActiveDownload) {
     const controller = new AbortController(); control.abort = controller; control.matching = true;
@@ -486,11 +639,11 @@ export class DownloadQueue {
     }
   }
 
-  private capture(command: string, args: string[]): Promise<{ stdout: Buffer; stderr: Buffer }> {
+  private capture(command: string, args: string[], timeoutMs = 120_000): Promise<{ stdout: Buffer; stderr: Buffer }> {
     return new Promise((resolve, reject) => {
       const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
       const stdout: Buffer[] = []; const stderr: Buffer[] = [];
-      const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error(`${command} timed out`)); }, 120_000); timer.unref();
+      const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error(`${command} timed out`)); }, timeoutMs); timer.unref();
       child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk)); child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
       child.once("error", (error) => { clearTimeout(timer); reject(error); });
       child.once("close", (code) => { clearTimeout(timer); code === 0 ? resolve({ stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) }) : reject(new Error(`${command} exited with code ${code}: ${Buffer.concat(stderr).toString("utf8").trim()}`)); });
@@ -505,4 +658,22 @@ export class DownloadQueue {
     try { return await result; }
     finally { if (this.finalizers.get(key) === settled) this.finalizers.delete(key); }
   }
+}
+
+const RECORDING_EXTENSIONS = new Set([".ts", ".mp4", ".mkv", ".flv", ".m4v", ".webm", ".part"]);
+
+/** What an interrupted recording left in its staging folder: recorder parts, or the largest partial file. */
+export function recordedInput(directory: string): { parts?: string[]; file?: string } | undefined {
+  const nonEmpty = (file: string) => { try { const stat = fs.statSync(file); return stat.isFile() && stat.size > 0; } catch { return false; } };
+  const partsDirectory = path.join(directory, "live-parts");
+  let parts: string[] = [];
+  try { parts = fs.readdirSync(partsDirectory).filter((name) => name.endsWith(".ts")).sort().map((name) => path.join(partsDirectory, name)).filter(nonEmpty); } catch { /* No recorder parts. */ }
+  if (parts.length) return { parts };
+  let files: string[] = [];
+  try {
+    files = fs.readdirSync(directory).map((name) => path.join(directory, name))
+      .filter((file) => nonEmpty(file) && (RECORDING_EXTENSIONS.has(path.extname(file).toLowerCase()) || /\.(?:mp4|mkv|ts|webm)\.part$/i.test(file)) && !path.basename(file).startsWith("recovered-"));
+  } catch { return undefined; }
+  if (!files.length) return undefined;
+  return { file: files.sort((left, right) => fs.statSync(right).size - fs.statSync(left).size)[0] };
 }
