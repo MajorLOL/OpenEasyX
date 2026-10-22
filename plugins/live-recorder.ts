@@ -1,6 +1,6 @@
 // Shared segmented live recorder. The queue signals its entire process group on POSIX.
 export const LIVE_RECORDER_SCRIPT = String.raw`
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const [mediaUrl, masterUrl, headersJson, output, gapArg, pollArg, userAgent, refreshUrl, refreshField] = process.argv.slice(1);
@@ -17,8 +17,19 @@ const say = (text) => process.stderr.write("[live-recorder] " + text + "\n");
 process.on("SIGINT", () => { stopping = true; if (process.platform === "win32") child?.kill("SIGINT"); controller.abort(); wake(); });
 process.on("SIGTERM", () => { stopping = true; cancelled = true; child?.kill("SIGKILL"); controller.abort(); wake(); });
 const sleep = (ms) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); wake = () => { clearTimeout(timer); resolve(); }; });
+// Retry a segment or playlist that fails once instead of skipping it (FFmpeg 6+ only;
+// Debian bookworm ships 5.1, so the option is used only when this FFmpeg knows it).
+const hlsHelp = (() => { try { return String(spawnSync("ffmpeg", ["-hide_banner", "-h", "demuxer=hls"], { encoding: "utf8", timeout: 10000 }).stdout || ""); } catch { return ""; } })();
+const retryArgs = [...(hlsHelp.includes("seg_max_retry") ? ["-seg_max_retry", "3"] : []), ...(hlsHelp.includes("max_reload") ? ["-max_reload", "10"] : [])];
+// Segments the HLS demuxer had to give up on leave a short freeze and an audio gap.
+let lostSegments = 0, failedRequests = 0;
 const run = (args) => new Promise((resolve) => {
-  child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "inherit"] });
+  child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+  child.stderr.on("data", (chunk) => {
+    const text = String(chunk); process.stderr.write(text);
+    for (const match of text.matchAll(/skipping (\d+) segments? ahead/gi)) lostSegments += Number(match[1]) || 1;
+    failedRequests += (text.match(/Failed to open segment|Failed to reload playlist|HTTP error 5\d\d|Connection timed out/gi) || []).length;
+  });
   child.once("error", () => { child = undefined; resolve(-1); });
   child.once("close", (code) => { child = undefined; resolve(code); });
 });
@@ -73,7 +84,7 @@ async function liveVariant(resolution) {
   while (!stopping) {
     const part = path.join(partsDir, "part-" + String(parts.length + 1).padStart(3, "0") + ".ts");
     const headerLines = Object.entries(headers).map(([name, value]) => name + ": " + value).join("\r\n") + "\r\n";
-    const code = await run(["-hide_banner", "-loglevel", "warning", "-rw_timeout", "15000000", "-user_agent", userAgent, "-headers", headerLines, "-i", url,
+    const code = await run(["-hide_banner", "-loglevel", "warning", "-rw_timeout", "15000000", ...retryArgs, "-user_agent", userAgent, "-headers", headerLines, "-i", url,
       "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-f", "mpegts", "-y", part]);
     const recorded = size(part) > 0;
     if (recorded) parts.push(part); else fs.rmSync(part, { force: true });
@@ -107,6 +118,7 @@ async function liveVariant(resolution) {
   if (joined !== 0 || size(output) === 0) { say("joining " + parts.length + " part(s) failed"); process.exit(1); }
   fs.rmSync(partsDir, { recursive: true, force: true });
   if (parts.length > 1) say("joined " + parts.length + " parts into one video");
+  if (lostSegments || failedRequests) say("stream problems: " + lostSegments + " segment(s) skipped, " + failedRequests + " failed request(s)");
   process.exit(0);
 })().catch((error) => { say(String((error && error.stack) || error)); process.exit(1); });
 `;

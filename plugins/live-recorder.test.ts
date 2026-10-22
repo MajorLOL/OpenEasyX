@@ -15,7 +15,7 @@ async function fixture(mode: "merge" | "stop" | "cancel" | "finite" | "refresh")
   const ffmpeg = execFileSync("which", ["ffmpeg"], { encoding: "utf8" }).trim();
   const bin = path.join(root, "bin"); fs.mkdirSync(bin);
   // Controlled stream endings; real FFmpeg remuxes the captured MPEG-TS parts.
-  fs.writeFileSync(path.join(bin, "ffmpeg"), `#!${process.execPath}\nconst fs=require('node:fs'),{spawnSync}=require('node:child_process');const args=process.argv.slice(2);if(args.includes('concat')){const result=spawnSync(${JSON.stringify(ffmpeg)},args,{stdio:'inherit'});process.exit(result.status??1)}fs.appendFileSync(${JSON.stringify(path.join(root, "inputs.txt"))}, args[args.indexOf('-i')+1]+'\\n');fs.copyFileSync(${JSON.stringify(sample)},args.at(-1));if(${JSON.stringify(mode)}==='stop'||${JSON.stringify(mode)}==='cancel'){setInterval(()=>{},1000);process.on('SIGINT',()=>process.exit(0))}`);
+  fs.writeFileSync(path.join(bin, "ffmpeg"), `#!${process.execPath}\nconst fs=require('node:fs'),{spawnSync}=require('node:child_process');const args=process.argv.slice(2);if(args.includes('-h'))process.exit(0);if(args.includes('concat')){const result=spawnSync(${JSON.stringify(ffmpeg)},args,{stdio:'inherit'});process.exit(result.status??1)}fs.appendFileSync(${JSON.stringify(path.join(root, "inputs.txt"))}, args[args.indexOf('-i')+1]+'\\n');fs.copyFileSync(${JSON.stringify(sample)},args.at(-1));if(${JSON.stringify(mode)}==='stop'||${JSON.stringify(mode)}==='cancel'){setInterval(()=>{},1000);process.on('SIGINT',()=>process.exit(0))}`);
   fs.chmodSync(path.join(bin, "ffmpeg"), 0o755);
   const output = path.join(root, "output.mp4");
   const server = http.createServer((request, response) => {

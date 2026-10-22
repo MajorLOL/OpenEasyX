@@ -1,5 +1,6 @@
 import { oldestMediaDate as mediaDate } from "../packages/media-date.js";
 import { ytDlpHeightSort } from "./hls-quality.js";
+import { spawnSync } from "node:child_process";
 import type { CommandDownloadRequest, LiveCam, LiveStream, MediaCandidate, PluginContext } from "../packages/plugin-sdk/index.js";
 
 type YtDlpEntry = Record<string, unknown> & { entries?: YtDlpEntry[] };
@@ -139,11 +140,26 @@ export function ytDlpDownload(item: MediaCandidate, config: Record<string, unkno
   if (heightSort) args.push("--format-sort", heightSort);
   args.push("--format", format, "--merge-output-format", "mp4", "--remux-video", "mp4", "--output", "{output}");
   // Capture separate live video/audio together, preserving their shared timeline.
-  if (options.live) args.push("--downloader", "ffmpeg", "--no-hls-use-mpegts");
+  if (options.live) {
+    args.push("--downloader", "ffmpeg", "--no-hls-use-mpegts");
+    // Retry a failed segment or playlist instead of skipping it (a skip leaves a freeze and an audio gap).
+    const retry = ffmpegHlsRetryArgs();
+    if (retry.length) args.push("--downloader-args", `ffmpeg_i:${retry.join(" ")}`);
+  }
   args.push(extractorUrl);
   return { kind: "command", command: "yt-dlp", args, filename: item.filename ?? `${item.externalId}.mp4` };
 }
 
 export function positiveInteger(value: unknown, fallback: number, maximum = 500): number {
   return Math.max(1, Math.min(maximum, Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : fallback));
+}
+
+let hlsRetryArgs: string[] | undefined;
+/** HLS demuxer retry options this FFmpeg supports (seg_max_retry needs FFmpeg 6+). */
+export function ffmpegHlsRetryArgs(): string[] {
+  if (hlsRetryArgs) return hlsRetryArgs;
+  let help = "";
+  try { help = String(spawnSync("ffmpeg", ["-hide_banner", "-h", "demuxer=hls"], { encoding: "utf8", timeout: 10_000 }).stdout ?? ""); } catch { /* No FFmpeg. */ }
+  hlsRetryArgs = [...(help.includes("seg_max_retry") ? ["-seg_max_retry", "3"] : []), ...(help.includes("max_reload") ? ["-max_reload", "10"] : [])];
+  return hlsRetryArgs;
 }
