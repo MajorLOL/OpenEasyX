@@ -28,12 +28,27 @@ export function downloadOutputPath(settings: Record<string, unknown>, item: Down
   }, extension);
 }
 
+/**
+ * Live streams sometimes drop audio for a moment (a lost segment, an encoder hiccup
+ * on the performer's side). Copied into MP4, those gaps disappear from the audio
+ * track, so most players run the audio ahead of the video: the recording drifts out
+ * of sync after every gap. Resampling with async fills each gap with silence at its
+ * original time, so audio and video stay aligned for the whole recording.
+ */
+export const LIVE_AUDIO_SYNC_FILTER = "aresample=async=1:min_hard_comp=0.100:first_pts=0";
+
+/** Keep the original video, rebuild the audio track in sync (cheap: audio only is encoded). */
+export function recordingSyncArgs(input: string, output: string): string[] {
+  return ["-y", "-nostdin", "-v", "error", "-fflags", "+genpts", "-i", input, "-map", "0:v:0", "-map", "0:a:0?",
+    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-af", LIVE_AUDIO_SYNC_FILTER, "-movflags", "+faststart", output];
+}
+
 export function recordingEncodingArgs(preset: RecordingPreset, input: string, output: string): string[] {
   if (preset === "source") return [];
   return ["-y", "-nostdin", "-v", "error", "-i", input, "-map", "0:v:0", "-map", "0:a:0?",
     "-c:v", preset === "h265" ? "libx265" : "libx264", "-preset", preset === "h264-small" ? "fast" : "medium",
     "-crf", preset === "h264-high" ? "18" : "26", "-pix_fmt", "yuv420p",
     "-vf", preset === "h264-small" ? "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2" : "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-    ...(preset === "h265" ? ["-tag:v", "hvc1"] : []), "-c:a", "aac", "-b:a", preset === "h264-high" ? "192k" : "128k",
+    ...(preset === "h265" ? ["-tag:v", "hvc1"] : []), "-c:a", "aac", "-b:a", preset === "h264-high" ? "192k" : "128k", "-af", LIVE_AUDIO_SYNC_FILTER,
     "-movflags", "+faststart", output];
 }
