@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { spawnSync } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Catalog } from "./catalog.js";
 import { LibraryDatabase } from "./library-database.js";
 
@@ -22,6 +22,19 @@ afterEach(() => {
 });
 
 describe("media catalog", () => {
+  it("ignores a thumbnail failure that arrives after the library database was closed", async () => {
+    const { data, media, db } = fixture();
+    fs.writeFileSync(path.join(media, "video.mp4"), "pending thumbnail");
+    const catalog = new Catalog(db, media, data, true);
+    let fail!: (reason: Error) => void;
+    const thumbnail = vi.spyOn(catalog, "thumbnail").mockReturnValue(new Promise((_, reject) => { fail = reject; }));
+    await catalog.scan();
+    db.close();
+    fail(new Error("Thumbnail process stopped during shutdown"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(thumbnail).toHaveBeenCalledTimes(1);
+    expect(db.markMediaUnplayable("closed-library")).toBe(false);
+  });
   it("migrates playback state created by the initial release", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-viewer-migration-")); roots.push(root);
     const data = path.join(root, "data"); fs.mkdirSync(data);

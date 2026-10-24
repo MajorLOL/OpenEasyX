@@ -46,5 +46,5 @@ export default definePlugin({
   },
   async resolveLiveStream(context, cam) { return ytDlpLiveStream(context, cam, { referer: "https://www.twitch.tv/" }); },
   async listLiveCams(context, query) { return listDiscoveredLiveCams(context, "twitch", query); },
-  async resolveDownload(context, item) { return ytDlpDownload(item, context.config, { referer: "https://www.twitch.tv/", live: true, maxHeight: recordingMaxHeight(context.config) }); },
+  async resolveDownload(context, item) { return ytDlpDownload(item, context.config, { referer: "https://www.twitch.tv/", live: true, hls: true, maxHeight: recordingMaxHeight(context.config) }); },
 });

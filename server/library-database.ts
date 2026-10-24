@@ -62,6 +62,7 @@ type IndexedMedia = Omit<Media, "favorite" | "progressSeconds" | "completed" | "
 
 export class LibraryDatabase {
   readonly sqlite: DatabaseSync;
+  private closed = false;
 
   constructor(dataDir: string) {
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -153,6 +154,7 @@ export class LibraryDatabase {
 
   close() {
     this.sqlite.close();
+    this.closed = true;
   }
 
   mergePerformerNames(previousName: string, nextName: string) {
@@ -188,6 +190,8 @@ export class LibraryDatabase {
   }
 
   markMediaUnplayable(id: string) {
+    // Background thumbnail failures may arrive after shutdown closes SQLite.
+    if (this.closed) return false;
     return Number(this.sqlite.prepare("UPDATE media SET playable=0 WHERE id=? AND playable=1").run(id).changes) > 0;
   }
 

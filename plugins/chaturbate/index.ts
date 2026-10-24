@@ -351,6 +351,6 @@ export default definePlugin({
   async resolveDownload(context, item) {
     const maxHeight = Number(context.config.recordingMaxHeight ?? 0);
     if (!Number.isInteger(maxHeight) || maxHeight < 0) throw new Error("Maximum recording height must be 0 (best available) or a positive integer such as 720.");
-    return ytDlpDownload(item, context.config, { referer: "https://chaturbate.com/", live: true, forceIpv4: context.config.forceIpv4 !== false, maxHeight });
+    return ytDlpDownload(item, context.config, { referer: "https://chaturbate.com/", live: true, hls: true, forceIpv4: context.config.forceIpv4 !== false, maxHeight });
   },
 });

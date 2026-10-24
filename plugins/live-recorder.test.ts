@@ -8,14 +8,29 @@ import { afterEach, describe, expect, it } from "vitest";
 import { LIVE_RECORDER_SCRIPT, retryDelay } from "./live-recorder.js";
 const cleanup: Array<() => unknown> = [];
 afterEach(() => { for (const dispose of cleanup.splice(0).reverse()) dispose(); });
-async function fixture(mode: "merge" | "stop" | "cancel" | "finite" | "refresh") {
+async function fixture(mode: "merge" | "stop" | "cancel" | "finite" | "refresh" | "stall" | "empty-retry" | "empty-loop") {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "easyx-recorder-'quoted-")); cleanup.push(() => fs.rmSync(root, { recursive: true, force: true }));
   const sample = path.join(root, "sample.ts");
   execFileSync("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10", "-t", "0.5", "-c:v", "libx264", "-f", "mpegts", sample]);
   const ffmpeg = execFileSync("which", ["ffmpeg"], { encoding: "utf8" }).trim();
   const bin = path.join(root, "bin"); fs.mkdirSync(bin);
   // Controlled stream endings; real FFmpeg remuxes the captured MPEG-TS parts.
-  fs.writeFileSync(path.join(bin, "ffmpeg"), `#!${process.execPath}\nconst fs=require('node:fs'),{spawnSync}=require('node:child_process');const args=process.argv.slice(2);if(args.includes('concat')){const result=spawnSync(${JSON.stringify(ffmpeg)},args,{stdio:'inherit'});process.exit(result.status??1)}fs.appendFileSync(${JSON.stringify(path.join(root, "inputs.txt"))}, args[args.indexOf('-i')+1]+'\\n');fs.copyFileSync(${JSON.stringify(sample)},args.at(-1));if(${JSON.stringify(mode)}==='stop'||${JSON.stringify(mode)}==='cancel'){setInterval(()=>{},1000);process.on('SIGINT',()=>process.exit(0))}`);
+  fs.writeFileSync(path.join(bin, "ffmpeg"), `#!${process.execPath}
+const fs = require('node:fs'), { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2), mode = ${JSON.stringify(mode)};
+if (args.includes('-h')) process.exit(0);
+if (args.includes('concat')) {
+  const result = spawnSync(${JSON.stringify(ffmpeg)}, args, { stdio: 'inherit' });
+  process.exit(result.status ?? 1);
+}
+const log = ${JSON.stringify(path.join(root, "inputs.txt"))};
+fs.appendFileSync(log, args[args.indexOf('-i') + 1] + '\\n');
+const attempt = fs.readFileSync(log, 'utf8').trim().split('\\n').length;
+if (mode === 'empty-loop' || (mode === 'empty-retry' && attempt === 2)) process.exit(1);
+fs.copyFileSync(${JSON.stringify(sample)}, args.at(-1));
+if (mode === 'stop' || mode === 'cancel' || (mode === 'stall' && attempt === 1)) {
+  setInterval(() => {}, 1000); process.on('SIGINT', () => process.exit(0));
+}`);
   fs.chmodSync(path.join(bin, "ffmpeg"), 0o755);
   const output = path.join(root, "output.mp4");
   const server = http.createServer((request, response) => {
@@ -26,12 +41,31 @@ async function fixture(mode: "merge" | "stop" | "cancel" | "finite" | "refresh")
   });
   server.listen(0, "127.0.0.1"); await once(server, "listening"); cleanup.push(() => server.close());
   const address = server.address() as { port: number }; const url = `http://127.0.0.1:${address.port}/live.m3u8`;
-  const child = spawn(process.execPath, ["-e", LIVE_RECORDER_SCRIPT, url, url, "{}", output, "300", "20", "Test", ...(mode === "refresh" ? [`http://127.0.0.1:${address.port}/streamInfo`, "cdnURL"] : [])], { detached: true, env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, ["-e", LIVE_RECORDER_SCRIPT, url, url, "{}", output, "300", "20", "Test", ...(mode === "refresh" ? [`http://127.0.0.1:${address.port}/streamInfo`, "cdnURL"] : [])], { detached: true, env: { ...process.env, EASYX_LIVE_STALL_SECONDS: "1", PATH: `${bin}:${process.env.PATH}` }, stdio: ["ignore", "pipe", "pipe"] });
   cleanup.push(() => { try { process.kill(-child.pid!, "SIGKILL"); } catch {} });
   const finished = once(child, "close"); let logs = ""; child.stderr.on("data", (chunk) => { logs += chunk; });
   return { root, output, child, finished, logs: () => logs };
 }
 describe("segmented live recorder", () => {
+  it("restarts an encoder that stays alive without producing more video and retains both parts", async () => {
+    const f = await fixture("stall");
+    expect((await f.finished)[0], f.logs()).toBe(0);
+    expect(f.logs()).toContain("stalled");
+    expect(f.logs()).toContain("joined 2 parts");
+    expect(Number(execFileSync("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", f.output], { encoding: "utf8" }))).toBeGreaterThan(.7);
+  }, 10_000);
+  it("retries a failed reconnect with no bytes instead of silently ending a longer session", async () => {
+    const f = await fixture("empty-retry");
+    expect((await f.finished)[0], f.logs()).toBe(0);
+    expect(fs.readFileSync(path.join(f.root, "inputs.txt"), "utf8").trim().split("\n")).toHaveLength(3);
+    expect(f.logs()).toContain("joined 2 parts");
+  }, 10_000);
+  it("bounds repeated empty reconnect attempts and frees the slot when no media can be captured", async () => {
+    const f = await fixture("empty-loop");
+    expect((await f.finished)[0], f.logs()).toBe(1);
+    expect(f.logs()).toContain("no video was recorded");
+    expect(fs.existsSync(f.output)).toBe(false);
+  }, 5000);
   it("joins two public stretches into a playable MP4, including paths containing apostrophes", async () => {
     const f = await fixture("merge"); expect((await f.finished)[0], f.logs()).toBe(0);
     const duration = Number(execFileSync("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", f.output], { encoding: "utf8" }));

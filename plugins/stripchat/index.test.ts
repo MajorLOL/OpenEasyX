@@ -107,6 +107,25 @@ describe("Stripchat direct live playback", () => {
 });
 
 describe("Stripchat account favorites", () => {
+  it("does not use a public model's identity as the connected account", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(pageState()))
+      .mockResolvedValueOnce(Response.json({ initialDynamic: { user: null } }));
+    const mock = { config: { cookiesFile: stripchatSession() }, fetch, log: vi.fn(), runCommand: vi.fn(async () => ({ exitCode: 1, stdout: "", stderr: "Not signed in" })) } as unknown as PluginContext;
+    expect(await stripchatFollowedSnapshot(mock)).toMatchObject({ authoritative: false });
+    expect(fetch.mock.calls.every(([url]) => !String(url).includes("/users/42/"))).toBe(true);
+  });
+  it("preserves partial favorites without declaring a truncated model list authoritative", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(accountPage()))
+      .mockResolvedValueOnce(Response.json({ modelIds: [11, 12] }))
+      .mockResolvedValueOnce(Response.json({ models: [{ id: 11, username: "Alice", status: "public" }] }));
+    const mock = { config: { cookiesFile: stripchatSession() }, fetch, log: vi.fn(), runCommand: vi.fn() } as unknown as PluginContext;
+    expect(await stripchatFollowedSnapshot(mock)).toMatchObject({ authoritative: false, cams: [expect.objectContaining({ username: "Alice" })] });
+  });
+  it("rejects an unsigned browser snapshot before reconciling local favorites", async () => {
+    const mock = { config: { cookiesFile: stripchatSession() }, fetch: vi.fn(async () => new Response("", { status: 403 })), log: vi.fn(),
+      runCommand: vi.fn(async () => ({ exitCode: 0, stderr: "", stdout: JSON.stringify({ loggedIn: false, modelIds: [], models: [] }) })) } as unknown as PluginContext;
+    expect(await stripchatFollowedSnapshot(mock)).toMatchObject({ authoritative: false });
+  });
   it("resolves only the requested creator even when the account follows thousands of models", async () => {
     const fetch = vi.fn()
       .mockResolvedValueOnce(new Response(accountPage()))

@@ -41,15 +41,13 @@ function balancedObject(value: string, from: number): string | undefined {
 
 function findCurrentUser(value: unknown): Record<string, unknown> | undefined {
   const item = record(value);
-  if (item) {
-    if (Number.isInteger(Number(item.id)) && Number(item.id) > 0 && (typeof item.username === "string" || typeof item.login === "string")) return item;
-    for (const key of ["currentUser", "current_user"]) {
-      const current = record(item[key]);
-      if (current && Number.isInteger(Number(current.id)) && Number(current.id) > 0) return current;
-    }
-    for (const child of Object.values(item)) { const found = findCurrentUser(child); if (found) return found; }
-  } else if (Array.isArray(value)) {
-    for (const child of value) { const found = findCurrentUser(child); if (found) return found; }
+  if (!item) return undefined;
+  // Only authenticated account fields can identify the viewer. Public model
+  // objects also contain an id and username, including on logged-out pages.
+  for (const candidate of [record(item.userSession)?.currentUser, item.currentUser, item.current_user, record(item.initialDynamic)?.user]) {
+    const current = record(candidate);
+    const user = record(current?.user) ?? current;
+    if (user && Number.isInteger(Number(user.id)) && Number(user.id) > 0) return user;
   }
   return undefined;
 }
@@ -121,15 +119,32 @@ async function stripchatFavoriteIds(context: PluginContext, account: StripchatAc
 
 async function favoriteSnapshot(context: PluginContext, account: StripchatAccount): Promise<LiveCamFavoriteSnapshot> {
   const ids = await stripchatFavoriteIds(context, account);
-  const unique = new Map<string, LiveCam & { online: boolean }>();
+  const models: unknown[] = [];
   for (let offset = 0; offset < ids.length; offset += 100) {
     const chunk = ids.slice(offset, offset + 100);
     const payload = await stripchatApi(context, account, "GET", "/models/list", {
       params: new URLSearchParams({ modelIds: chunk.join(",") }),
     });
-    for (const cam of stripchatFavoriteCams(payload)) unique.set(cam.username.toLowerCase(), cam);
+    const page = record(payload)?.models;
+    if (!Array.isArray(page)) throw new Error("Stripchat returned invalid followed model details");
+    models.push(...page);
   }
-  return { cams: [...unique.values()], authoritative: true };
+  return favoriteModelsSnapshot(ids, models);
+}
+
+function favoriteModelsSnapshot(ids: number[], models: unknown[]): LiveCamFavoriteSnapshot {
+  const expected = new Set(ids);
+  const seen = new Set<number>();
+  const unique = new Map<string, LiveCam & { online: boolean }>();
+  for (const model of models) {
+    const id = Number(record(model)?.id);
+    if (!expected.has(id) || seen.has(id)) throw new Error("Stripchat returned unexpected or duplicate followed model details");
+    seen.add(id);
+    for (const cam of stripchatFavoriteCams({ models: [model] })) unique.set(cam.username.toLowerCase(), cam);
+  }
+  const complete = unique.size === ids.length && seen.size === ids.length;
+  return { cams: [...unique.values()], authoritative: complete,
+    ...(!complete ? { skippedReason: "Stripchat returned an incomplete followed model list. Local favorites are kept; synchronization will retry." } : {}) };
 }
 
 /** Validated followed IDs; throws on anything that is not a complete, plausible list. */
@@ -156,12 +171,10 @@ async function browserFavoriteSnapshot(context: PluginContext): Promise<LiveCamF
   let payload: unknown;
   try { payload = JSON.parse(result.stdout); } catch { throw new Error("Stripchat returned an invalid favorites response"); }
   const value = record(payload);
-  followedIdList(value?.modelIds);
+  if (value?.loggedIn !== true || !Number.isInteger(Number(value.userId)) || Number(value.userId) <= 0) throw new Error("The Stripchat browser session is not signed in. Reconnect the account.");
+  const ids = followedIdList(value.modelIds);
   if (!Array.isArray(value?.models)) throw new Error("Stripchat returned no followed model details");
-  const unique = new Map<string, LiveCam & { online: boolean }>();
-  for (const cam of stripchatFavoriteCams({ models: value.models })) unique.set(cam.username.toLowerCase(), cam);
-  // Same trust as the direct API: every chunk was answered, so the list is complete.
-  return { cams: [...unique.values()], authoritative: true };
+  return favoriteModelsSnapshot(ids, value.models);
 }
 
 export async function stripchatFollowedSnapshot(context: PluginContext): Promise<LiveCamFavoriteSnapshot> {

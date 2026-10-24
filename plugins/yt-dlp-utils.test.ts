@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { liveStreamFromInfo, ytDlpDownload } from "./yt-dlp-utils.js";
+import { ffmpegHlsRetryArgs, liveStreamFromInfo, ytDlpDownload } from "./yt-dlp-utils.js";
 
 describe("live stream selection", () => {
   it("keeps separate live video and audio tracks when yt-dlp selected both formats", () => {
@@ -26,6 +26,17 @@ describe("live stream selection", () => {
 });
 
 describe("live recording output", () => {
+  it("asks FFmpeg to retry failed live segments when it supports that", () => {
+    const request = ytDlpDownload({ externalId: "live:alice", mediaType: "video", pageUrl: "https://live.test/alice" }, {}, { live: true, hls: true });
+    const retry = ffmpegHlsRetryArgs();
+    if (retry.length) expect(request.args[request.args.indexOf("--downloader-args") + 1]).toBe(`ffmpeg_i:${retry.join(" ")}`);
+    else expect(request.args).not.toContain("--downloader-args");
+  });
+
+  it("does not pass HLS-specific options to live extractors with an unknown protocol", () => {
+    expect(ytDlpDownload({ externalId: "live", mediaType: "video", pageUrl: "https://live.test/alice" }, {}, { live: true }).args).not.toContain("--downloader-args");
+  });
+
   it("records the highest quality without a format sort when set to automatic", () => {
     const request = ytDlpDownload({ externalId: "live:alice", mediaType: "video", pageUrl: "https://live.test/alice" }, {}, { live: true, maxHeight: 0 });
     expect(request.args[request.args.indexOf("--format") + 1]).toBe("bestvideo+bestaudio/best");

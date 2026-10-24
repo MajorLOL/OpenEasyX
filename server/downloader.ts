@@ -6,11 +6,13 @@ import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { spawn, type ChildProcess } from "node:child_process";
+import { createInterface } from "node:readline";
+import { AudioGapCounter, liveAudioSyncEnabled } from "./live-audio-sync.js";
 import type { Database, DownloadItem } from "./database.js";
 import type { PluginManager } from "./plugin-manager.js";
 import type { LogWriter } from "./log-store.js";
 import { filenameFromUrl, safeSegment } from "./utils.js";
-import { downloadOutputPath, recordingEncodingArgs } from "./output-settings.js";
+import { downloadOutputPath, recordingEncodingArgs, recordingSyncArgs } from "./output-settings.js";
 import { outputSettings } from "../packages/output-settings.js";
 import { canMatchVideoExcerpt, fingerprintVideo, verifyVideoContainment, videoFileStamp, type VideoFingerprint } from "./video-matching.js";
 import type { Source } from "./database.js";
@@ -280,11 +282,13 @@ export class DownloadQueue {
           "{outputDir}": path.dirname(temporary),
           "{outputName}": path.basename(temporary),
         };
-        await this.runCommandDownload(request.command, request.args.map((argument) => {
+        const commandOutput = await this.runCommandDownload(request.command, request.args.map((argument) => {
           for (const [placeholder, value] of Object.entries(placeholders)) argument = argument.replaceAll(placeholder, value);
           return argument;
         }), temporaryDirectory, item.expectedBytes, reportProgress, control, request.requireSuccessfulExit);
         if (!fs.existsSync(temporary) || fs.statSync(temporary).size === 0) throw new Error("Extractor completed without producing a media file");
+        const problems = /\[live-recorder\] stream problems: (\d+) segment\(s\) skipped, (\d+) failed request\(s\)(?:, (\d+) stalled capture\(s\))?/.exec(commandOutput);
+        if (problems) this.writeLog?.("warn", "download", "Live stream encountered capture interruptions", { itemId: item.id, title: item.title, skippedSegments: Number(problems[1]), failedRequests: Number(problems[2]), stalledCaptures: Number(problems[3] ?? 0) });
         reportProgress(0.99, fs.statSync(temporary).size, true);
         checksum = await this.hashFile(temporary);
       } else {
@@ -313,6 +317,29 @@ export class DownloadQueue {
         if (!fs.existsSync(encoded) || !fs.statSync(encoded).size) throw new Error("Encoder completed without producing a media file");
         fs.unlinkSync(temporary); temporary = encoded;
         checksum = await this.hashFile(temporary);
+      } else if (item.mediaType === "video" && item.metadata.live === true && liveAudioSyncEnabled()) {
+        // A healthy recording stays exactly as captured. Only when its audio has gaps (which
+        // make players drift out of sync) is the audio rebuilt in sync; the video is copied.
+        const synced = path.join(temporaryDirectory, `synced${path.extname(temporary) || ".mp4"}`);
+        control.action = undefined; control.encoding = true;
+        this.db.setItemStatus(item.id, "downloading", { progress: 0.99 });
+        try {
+          const gaps = await this.audioGaps(temporary, control);
+          if (control.action === "cancel" || control.action === "delete") throw new Error("Recording cancelled");
+          if (gaps.count) {
+            this.writeLog?.("info", "download", "Repairing audio/video sync of the live recording", { itemId: item.id, audioGaps: gaps.count, missingSeconds: Math.round(gaps.seconds * 10) / 10 });
+            await this.runCommandDownload("ffmpeg", recordingSyncArgs(temporary, synced), temporaryDirectory, undefined, () => {}, control, true);
+            if (control.action === "cancel" || control.action === "delete") throw new Error("Recording cancelled");
+            if (!fs.existsSync(synced) || !fs.statSync(synced).size) throw new Error("FFmpeg produced no file");
+            const syncedChecksum = await this.hashFile(synced);
+            fs.unlinkSync(temporary); temporary = synced; checksum = syncedChecksum;
+          }
+        } catch (error) {
+          if (control.action === "cancel" || control.action === "delete") throw error;
+          fs.rmSync(synced, { force: true });
+          this.writeLog?.("warn", "download", "Audio/video sync repair skipped; the recording is kept as captured", { itemId: item.id, error: error instanceof Error ? error.message : String(error) });
+        }
+        control.encoding = false;
       }
       await this.withFinalizeLock("output", async () => {
         if (["cancel", "delete"].includes(control.action ?? "")) throw new Error("Download cancelled");
@@ -410,6 +437,42 @@ export class DownloadQueue {
     }
   }
 
+  /** Use decoded sample counts: MP4 stretches packet durations over missing audio,
+   * so packet timestamps and durations alone hide the very gaps we need to repair. */
+  private async audioGaps(file: string, control?: ActiveDownload): Promise<{ count: number; seconds: number }> {
+    const metadata = await this.capture("ffprobe", ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate", "-of", "json", file]);
+    const stream = (JSON.parse(metadata.stdout.toString("utf8")) as { streams?: Array<{ sample_rate?: string }> }).streams?.[0];
+    if (!stream) return { count: 0, seconds: 0 };
+    const rate = Number(stream.sample_rate);
+    if (!Number.isFinite(rate) || rate <= 0) throw new Error("The audio sample rate could not be determined");
+    if (control?.action === "cancel" || control?.action === "delete") throw new Error("Recording cancelled");
+    return new Promise((resolve, reject) => {
+      const child = spawn("ffprobe", ["-v", "error", "-select_streams", "a:0", "-show_entries", "frame=best_effort_timestamp_time,nb_samples", "-of", "csv=p=0", file], { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+      if (control) {
+        control.child = child;
+        if (control.action) this.signal(control, "SIGTERM");
+      }
+      const counter = new AudioGapCounter();
+      const lines = createInterface({ input: child.stdout });
+      lines.on("line", (line) => {
+        const [pts, rawSamples] = line.split(",");
+        const samples = Number(rawSamples);
+        if (Number.isFinite(samples) && samples > 0) counter.add(`${pts},${samples / rate}`);
+      });
+      let error = "", settled = false, timedOut = false;
+      child.stderr.on("data", (chunk) => { error = (error + chunk).slice(-4000); });
+      const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 10 * 60_000);
+      timer.unref();
+      const finish = (failure?: Error) => {
+        if (settled) return; settled = true; clearTimeout(timer); lines.close();
+        if (control?.child === child) control.child = undefined;
+        failure ? reject(failure) : resolve(counter.result());
+      };
+      child.once("error", (error) => finish(error));
+      child.once("close", (code) => finish(code === 0 && !timedOut ? undefined : new Error(timedOut ? "Audio analysis timed out" : `Audio analysis failed: ${error.trim() || code}`)));
+    });
+  }
+
   private get downloadsRoot() { return path.join(this.mediaRoot, ".downloads"); }
 
   /**
@@ -437,6 +500,13 @@ export class DownloadQueue {
           await this.capture("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", input.file!, "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", "-y", output], 30 * 60_000);
         }
         if (!fs.existsSync(output) || fs.statSync(output).size === 0) throw new Error("FFmpeg produced no video");
+        if (liveAudioSyncEnabled() && (await this.audioGaps(output).catch(() => ({ count: 0 }))).count) {
+          const synced = path.join(directory, `recovered-synced-${Date.now()}.mp4`);
+          try {
+            await this.capture("ffmpeg", recordingSyncArgs(output, synced), 30 * 60_000);
+            if (fs.existsSync(synced) && fs.statSync(synced).size > 0) fs.renameSync(synced, output);
+          } catch { fs.rmSync(synced, { force: true }); }
+        }
         const performer = this.db.getPerformer(item.performerId); const source = this.db.getSource(item.sourceId);
         if (!performer || !source) throw new Error("The performer or source no longer exists");
         const fallback = `${item.externalId}.mp4`;
@@ -543,7 +613,7 @@ export class DownloadQueue {
     child.kill(signal);
   }
 
-  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, requireSuccessfulExit = false): Promise<void> {
+  private runCommandDownload(command: string, args: string[], outputDirectory: string, expectedBytes: number | undefined, reportProgress: (progress?: number, downloadedBytes?: number, force?: boolean) => void, control: ActiveDownload, requireSuccessfulExit = false): Promise<string> {
     return new Promise((resolve, reject) => {
       const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
       control.child = child;
@@ -564,7 +634,7 @@ export class DownloadQueue {
         const downloadedBytes = this.directoryBytes(outputDirectory);
         if (downloadedBytes > 0) reportProgress(expectedBytes ? downloadedBytes / expectedBytes : undefined, downloadedBytes);
       }, 250); poll.unref();
-      const finish = (error?: Error) => { if (settled) return; settled = true; clearInterval(poll); error ? reject(error) : resolve(); };
+      const finish = (error?: Error) => { if (settled) return; settled = true; clearInterval(poll); error ? reject(error) : resolve(output); };
       child.once("error", (error) => finish(error));
       child.once("close", (code) => {
         control.child = undefined;

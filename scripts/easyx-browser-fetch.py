@@ -457,24 +457,35 @@ def stripchat_favorite(url: str, cookies_file: str, model_id: int, follow: bool)
 
 
 STRIPCHAT_FAVORITES_SCRIPT = r"""(async () => {
+  if (!/^https?:$/.test(window.location.protocol) || document.readyState === "loading") return { ready: false, loggedIn: false };
   const state = (() => { try { return (window.getState && window.getState()) || window.__PRELOADED_STATE__ || null; } catch { return window.__PRELOADED_STATE__ || null; } })();
-  const userId = Number(state?.userSession?.currentUser?.id || 0);
-  if (!userId) return { ready: Boolean(state), loggedIn: false };
-  const frontVersion = String(state?.config?.releaseVersion || state?.configV3?.releaseVersion || "");
+  const frontVersion = String(state?.config?.releaseVersion || state?.configV3?.releaseVersion || window.PAGE_CONFIG?.releaseVersion || "");
   const headers = { accept: "application/json", ...(frontVersion ? { "front-version": frontVersion } : {}) };
   const get = async (path) => {
     const response = await fetch(path, { credentials: "include", headers });
     if (!response.ok) throw new Error(`HTTP ${response.status} for ${path.split("?")[0]}`);
     return response.json();
   };
+  // Current pages do not expose the signed-in viewer in __PRELOADED_STATE__.
+  // Read the same dynamic account configuration the page requests, with the
+  // imported browser cookies, instead of waiting forever for the old state.
+  let user = state?.userSession?.currentUser || state?.currentUser || state?.initialDynamic?.user;
+  if (!user?.id) {
+    const config = await get("/api/front/v3/config/initial-dynamic?requestPath=%2Ffavorites");
+    user = config?.initialDynamic?.user;
+  }
+  const userId = Number(user?.user?.id || user?.id || 0);
+  if (!Number.isInteger(userId) || userId <= 0) return { ready: true, loggedIn: false };
   const favorites = await get(`/api/front/users/${userId}/favorites`);
   const modelIds = Array.isArray(favorites?.modelIds) ? favorites.modelIds.map(Number) : null;
   if (!modelIds) throw new Error("Stripchat returned no followed ID list");
+  if (modelIds.length > 5000 || new Set(modelIds).size !== modelIds.length || modelIds.some(id => !Number.isInteger(id) || id <= 0)) throw new Error("Stripchat returned invalid followed IDs");
   const models = [];
   for (let offset = 0; offset < modelIds.length; offset += 100) {
     const chunk = modelIds.slice(offset, offset + 100);
     const page = await get(`/api/front/models/list?modelIds=${encodeURIComponent(chunk.join(","))}`);
-    if (Array.isArray(page?.models)) models.push(...page.models);
+    if (!Array.isArray(page?.models)) throw new Error("Stripchat returned invalid followed model details");
+    models.push(...page.models);
   }
   return { ready: true, loggedIn: true, userId, modelIds, models };
 })()"""
@@ -520,12 +531,25 @@ async def _stripchat_favorites_cdp(websocket_url: str, cookies: list[dict[str, o
             deadline = time.monotonic() + 40
             while time.monotonic() < deadline:
                 response = await command("Runtime.evaluate", {"expression": STRIPCHAT_FAVORITES_SCRIPT, "returnByValue": True, "awaitPromise": True}, timeout=45)
-                result = ((response.get("result") or {}).get("result") or {})
+                protocol_error = response.get("error") or {}
+                if protocol_error:
+                    if any(reason in str(protocol_error.get("message", "")) for reason in ("context was destroyed", "Cannot find context", "Inspected target navigated")):
+                        await asyncio.sleep(1)
+                        continue
+                    raise RuntimeError(str(protocol_error.get("message") or "Chromium could not read Stripchat favorites"))
+                evaluation = response.get("result") or {}
+                exception = evaluation.get("exceptionDetails") or {}
+                if exception:
+                    details = exception.get("exception") or {}
+                    raise RuntimeError(str(details.get("description") or exception.get("text") or "Stripchat favorites could not be read").splitlines()[0])
+                result = evaluation.get("result") or {}
                 if result.get("subtype") == "error":
                     raise RuntimeError(str(result.get("description") or "Stripchat favorites could not be read").splitlines()[0])
                 last = result.get("value") if isinstance(result.get("value"), dict) else {}
                 if last.get("loggedIn"):
                     return last
+                if last.get("ready"):
+                    raise RuntimeError("The Stripchat session is not signed in. Reconnect the account.")
                 await asyncio.sleep(1)
             if last.get("ready"):
                 raise RuntimeError("The Stripchat session is not signed in. Reconnect the account.")

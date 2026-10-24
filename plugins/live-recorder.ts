@@ -1,6 +1,6 @@
 // Shared segmented live recorder. The queue signals its entire process group on POSIX.
 export const LIVE_RECORDER_SCRIPT = String.raw`
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 const [mediaUrl, masterUrl, headersJson, output, gapArg, pollArg, userAgent, refreshUrl, refreshField] = process.argv.slice(1);
@@ -17,10 +17,47 @@ const say = (text) => process.stderr.write("[live-recorder] " + text + "\n");
 process.on("SIGINT", () => { stopping = true; if (process.platform === "win32") child?.kill("SIGINT"); controller.abort(); wake(); });
 process.on("SIGTERM", () => { stopping = true; cancelled = true; child?.kill("SIGKILL"); controller.abort(); wake(); });
 const sleep = (ms) => new Promise((resolve) => { const timer = setTimeout(resolve, ms); wake = () => { clearTimeout(timer); resolve(); }; });
-const run = (args) => new Promise((resolve) => {
-  child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "inherit"] });
-  child.once("error", () => { child = undefined; resolve(-1); });
-  child.once("close", (code) => { child = undefined; resolve(code); });
+// Retry a segment or playlist that fails once instead of skipping it (FFmpeg 6+ only;
+// Debian bookworm ships 5.1, so the option is used only when this FFmpeg knows it).
+const hlsHelp = (() => { try { return String(spawnSync("ffmpeg", ["-hide_banner", "-h", "demuxer=hls"], { encoding: "utf8", timeout: 10000 }).stdout || ""); } catch { return ""; } })();
+const retryArgs = [...(hlsHelp.includes("seg_max_retry") ? ["-seg_max_retry", "3"] : []), ...(hlsHelp.includes("max_reload") ? ["-max_reload", "10"] : []), ...(hlsHelp.includes("m3u8_hold_counters") ? ["-m3u8_hold_counters", "10"] : [])];
+const stallSeconds = Number(process.env.EASYX_LIVE_STALL_SECONDS || 60);
+const stallMs = Number.isFinite(stallSeconds) && stallSeconds > 0 ? Math.max(1, stallSeconds) * 1000 : 60000;
+// Segments the HLS demuxer had to give up on leave a short freeze and an audio gap.
+let lostSegments = 0, failedRequests = 0, stalledCaptures = 0;
+const run = (args, recordingPart) => new Promise((resolve) => {
+  const encoder = child = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+  let lastGrowth = Date.now(), lastTick = lastGrowth, lastSize = 0, watchdog, killTimer, errors = "";
+  // A playlist can return HTTP 200 forever without publishing another segment.
+  // Bound that wait and reconnect while preserving the part already captured.
+  if (recordingPart) watchdog = setInterval(() => {
+    const now = Date.now();
+    // SIGSTOP pauses the whole group; a user pause must not count as a stall.
+    if (now - lastTick > 3000) lastGrowth += now - lastTick - 1000;
+    lastTick = now;
+    const bytes = size(recordingPart);
+    if (bytes > lastSize) { lastSize = bytes; lastGrowth = now; }
+    if (stopping || killTimer || now - lastGrowth < stallMs) return;
+    stalledCaptures += 1;
+    say("capture stalled without new video; reconnecting and keeping the recorded part");
+    encoder.kill("SIGINT");
+    killTimer = setTimeout(() => encoder.kill("SIGKILL"), 10000);
+  }, 1000);
+  // Drain progress output even when the enclosing queue does not consume it.
+  encoder.stdout.resume();
+  const countErrors = (line) => {
+    for (const match of line.matchAll(/skipping (\d+) segments? ahead/gi)) lostSegments += Number(match[1]) || 1;
+    failedRequests += (line.match(/Failed to open segment|Failed to reload playlist|HTTP error 5\d\d|Connection timed out/gi) || []).length;
+  };
+  child.stderr.on("data", (chunk) => {
+    const text = String(chunk); process.stderr.write(text);
+    errors += text;
+    const lines = errors.split(/\r?\n/); errors = lines.pop().slice(-8000);
+    for (const line of lines) countErrors(line);
+  });
+  const finish = (code) => { clearInterval(watchdog); clearTimeout(killTimer); countErrors(errors); errors = ""; if (child === encoder) child = undefined; resolve(code); };
+  encoder.once("error", () => finish(-1));
+  encoder.once("close", (code) => finish(code));
 });
 const size = (file) => { try { return fs.statSync(file).size; } catch { return 0; } };
 const isLive = (text) => text.trimStart().startsWith("#EXTM3U") && !text.includes("#EXT-X-MOUFLON-ADVERT")
@@ -68,16 +105,16 @@ async function liveVariant(resolution) {
 }
 (async () => {
   const parts = [];
-  let url = mediaUrl, resolution;
+  let url = mediaUrl, resolution, lastRecording = Date.now();
   try { resolution = (await variants()).find((item) => item.url === mediaUrl)?.resolution; } catch {}
   while (!stopping) {
     const part = path.join(partsDir, "part-" + String(parts.length + 1).padStart(3, "0") + ".ts");
     const headerLines = Object.entries(headers).map(([name, value]) => name + ": " + value).join("\r\n") + "\r\n";
-    const code = await run(["-hide_banner", "-loglevel", "warning", "-rw_timeout", "15000000", "-user_agent", userAgent, "-headers", headerLines, "-i", url,
-      "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-f", "mpegts", "-y", part]);
+    const code = await run(["-hide_banner", "-loglevel", "warning", "-rw_timeout", "15000000", ...retryArgs, "-user_agent", userAgent, "-headers", headerLines, "-i", url,
+      "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-flush_packets", "1", "-f", "mpegts", "-y", part], part);
     const recorded = size(part) > 0;
-    if (recorded) parts.push(part); else fs.rmSync(part, { force: true });
-    if (stopping || !recorded || gapMs <= 0) break;
+    if (recorded) { parts.push(part); lastRecording = Date.now(); } else fs.rmSync(part, { force: true });
+    if (stopping || code === -1 || gapMs <= 0) break;
     if (resolution === undefined) {
       try {
         const first = new URL(mediaUrl).pathname;
@@ -85,7 +122,9 @@ async function liveVariant(resolution) {
       } catch { resolution = ""; }
     }
     say("stream stopped (ffmpeg exit " + code + "); waiting up to " + (gapMs >= 60000 ? Math.round(gapMs / 60000) + " min" : Math.round(gapMs / 1000) + " s") + " for the room to return");
-    const deadline = Date.now() + gapMs;
+    // Empty reconnect attempts share one deadline, so a permanently broken
+    // public URL cannot occupy a download slot indefinitely.
+    const deadline = lastRecording + gapMs;
     url = "";
     while (!stopping && Date.now() < deadline) {
       await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
@@ -107,6 +146,7 @@ async function liveVariant(resolution) {
   if (joined !== 0 || size(output) === 0) { say("joining " + parts.length + " part(s) failed"); process.exit(1); }
   fs.rmSync(partsDir, { recursive: true, force: true });
   if (parts.length > 1) say("joined " + parts.length + " parts into one video");
+  if (lostSegments || failedRequests || stalledCaptures) say("stream problems: " + lostSegments + " segment(s) skipped, " + failedRequests + " failed request(s), " + stalledCaptures + " stalled capture(s)");
   process.exit(0);
 })().catch((error) => { say(String((error && error.stack) || error)); process.exit(1); });
 `;

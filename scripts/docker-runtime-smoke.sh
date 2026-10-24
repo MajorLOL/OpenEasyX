@@ -37,5 +37,7 @@ docker exec "$container" node -e "fetch('http://127.0.0.1:3210/browser/vnc.html'
 docker cp scripts/browser-paste-smoke.mjs "$container:/tmp/browser-paste-smoke.mjs"
 docker exec "$container" node /tmp/browser-paste-smoke.mjs
 docker exec "$container" node -e "fetch('http://127.0.0.1:3210/api/plugins/org.easyx.manyvids/browser-login',{method:'DELETE'}).then(r=>{if(!r.ok)throw Error('stop '+r.status)})"
+docker cp scripts/easyx-browser-fetch.test.py "$container:/tmp/easyx-browser-fetch.test.py"
+docker exec -e EASYX_BROWSER_FETCH_SCRIPT=/usr/local/bin/easyx-browser-fetch "$container" /opt/easyx/bin/python /tmp/easyx-browser-fetch.test.py
 sleep 1
 docker exec "$container" sh -lc 'if ps -eo stat | grep -q "^Z"; then exit 1; fi'
