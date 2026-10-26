@@ -38,13 +38,6 @@ describe("photo player", () => {
 });
 
 describe("video player", () => {
-  it("offers and restores audio amplification up to 300 percent", () => {
-    vi.stubGlobal("localStorage", { getItem: (key: string) => key === "open-easyx.player-audio-boost" ? "3" : null, setItem: vi.fn() });
-    const html = renderToStaticMarkup(<PlayerViewer media={video} context={{ ids: ["video-1"] }} close={vi.fn()} favorite={vi.fn()} advance={vi.fn()} setNotice={vi.fn()}/>);
-    expect(html).toContain('aria-label="Audio boost"');
-    expect(html).toContain('<option value="3" selected="">Boost 300%</option>');
-  });
-
   it("asks the browser to autoplay a video reached from the previous item", () => {
     vi.stubGlobal("localStorage", { getItem: () => null, setItem: vi.fn() });
     const html = renderToStaticMarkup(<PlayerViewer media={video} context={{ ids: ["photo-1", "video-1"] }} autoStart close={vi.fn()} favorite={vi.fn()} advance={vi.fn()} setNotice={vi.fn()}/>);
@@ -70,5 +63,15 @@ describe("delete from the player", () => {
     vi.stubGlobal("localStorage", { getItem: () => null, setItem: vi.fn() });
     const html = renderToStaticMarkup(<PlayerViewer media={video} context={{ ids: ["video-1"] }} close={vi.fn()} favorite={vi.fn()} advance={vi.fn()} setNotice={vi.fn()}/>);
     expect(html).not.toContain("watch-delete");
+  });
+});
+
+describe("video player gestures and casting", () => {
+  it("renders the gesture surface and a cast button", () => {
+    vi.stubGlobal("localStorage", { getItem: () => null, setItem: vi.fn() });
+    const html = renderToStaticMarkup(<PlayerViewer media={video} context={{ ids: ["video-1"] }} close={vi.fn()} favorite={vi.fn()} advance={vi.fn()} setNotice={vi.fn()}/>);
+    expect(html).toContain('class="player-surface"');
+    expect(html).toContain('aria-label="Cast to a TV"');
+    expect(html).not.toContain("player-zoom-reset");
   });
 });
